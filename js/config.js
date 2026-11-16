@@ -15,7 +15,7 @@ window.CONFIG = {
   DATA_URL: "",
 
   // Shown to participants if their upload fails, so they can send the file.
-  RESEARCHER_CONTACT: "EDIT ME — Your Name (you@university.edu)",
+  RESEARCHER_CONTACT: "Shreelekha Basavaraja Sangapur : UTS  at shreelekha.basavaraja@student.uts.edu.au",
 
   // ── Prolific ──────────────────────────────────────────────────────────
   // The study link on Prolific should be:
@@ -24,8 +24,8 @@ window.CONFIG = {
   // sent to Prolific with COMPLETION_CODE (copy it from your Prolific study's
   // "Completion paths" section).
   PROLIFIC: {
-    COMPLETION_CODE: "EDIT_ME",
-    COMPLETION_URL: "https://app.prolific.com/submissions/complete?cc=",
+    COMPLETION_CODE: "C1DQL3O3",
+    COMPLETION_URL: "https://app.prolific.com/submissions/complete?cc=C1DQL3O3",
     AUTO_REDIRECT_SEC: 0,   // 0 = participant clicks "Return to Prolific"; >0 = also redirect after this many seconds
   },
 
