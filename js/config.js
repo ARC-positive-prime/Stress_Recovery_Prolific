@@ -1,130 +1,214 @@
 /*
- * Study configuration — edit this file, nothing else, for normal use.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  STUDY SETTINGS: edit this file (and js/texts.js for wording) for normal use.
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- * Timings are in milliseconds unless a comment says otherwise. Values mirror
- * the PsychoPy originals in stress-recovery-exp-with-stroop (stroop.py,
- * mist_l5.py, mist.py, vas.py, image_viewing.py) unless a comment says
- * otherwise.
+ *  Where is what?
+ *    js/config.js   ← THIS FILE: upload address, Prolific code, the order of
+ *                     the experiment (FLOW), trial counts, timings, keys,
+ *                     image conditions.
+ *    js/texts.js    ← every sentence participants read (instructions,
+ *                     information sheet, debrief).
+ *    debug.html     ← open this to test any single part of the experiment.
+ *    images/<condition>/  + tools/build_image_manifest.bat ← image sets.
+ *
+ *  Timings are in milliseconds unless a comment says otherwise.
+ *  Search this file for "EDIT ME" to find what must be set before going live.
  */
 window.CONFIG = {
   STUDY_TITLE: "Stress, Attention and Images Study",
+  APP_VERSION: "2.0.0",
 
-  // Google Apps Script web-app URL (ends in /exec). See README → "Data
-  // collection setup". Leave "" to run without uploading (data can still be
-  // downloaded as JSON on the last screen — useful for piloting).
-  DATA_URL: "",
-
-  // Shown to participants if their upload fails, so they can send the file.
-  RESEARCHER_CONTACT: "Shreelekha Basavaraja Sangapur : UTS  at shreelekha.basavaraja@student.uts.edu.au",
-
-  // ── Prolific ──────────────────────────────────────────────────────────
-  // The study link on Prolific should be:
-  //   https://<you>.github.io/<repo>/?PROLIFIC_PID={{%PROLIFIC_PID%}}&STUDY_ID={{%STUDY_ID%}}&SESSION_ID={{%SESSION_ID%}}
-  // PROLIFIC_PID becomes the participant code. At the end, participants are
-  // sent to Prolific with COMPLETION_CODE (copy it from your Prolific study's
-  // "Completion paths" section).
-  PROLIFIC: {
-    COMPLETION_CODE: "C1DQL3O3",
-    COMPLETION_URL: "https://app.prolific.com/submissions/complete?cc=C1DQL3O3",
-    AUTO_REDIRECT_SEC: 0,   // 0 = participant clicks "Return to Prolific"; >0 = also redirect after this many seconds
+  // ── Where the data go ──────────────────────────────────────────────────
+  // Each participant's data is ONE JSON file (see docs/DATA_FORMAT.md),
+  // uploaded to a Microsoft receiver (receivers/README.md):
+  //   Power Automate "When an HTTP request is received" URL → OneDrive / SharePoint
+  //   or an Azure Function URL → Blob Storage
+  //   or http://localhost:8787/upload while piloting (node receivers/local_test_server.js).
+  // Leave "" to run without uploading: the last screen then offers the file
+  // as a download (handy for piloting).
+  DATA: {
+    UPLOAD_URL: "",                  // ← EDIT ME before going live
+    UPLOAD_PROGRESS: true,           // also save a snapshot after every step (keeps data of drop-outs)
+    UPLOAD_TIMEOUT_MS: 30000,        // one upload attempt
+    FINAL_UPLOAD_DEADLINE_MS: 120000, // max time on the "Saving…" screen at the end (slow connections)
   },
 
-  // Minimum screen size; smaller screens (phones, tablets) are turned away.
+  // Shown in the information sheet and when an upload fails.
+  RESEARCHER_CONTACT: "EDIT ME — Your Name (you@university.edu)",
+
+  // ── Prolific ──────────────────────────────────────────────────────────
+  // Study URL on Prolific:
+  //   https://<you>.github.io/<repo>/?PROLIFIC_PID={{%PROLIFIC_PID%}}&STUDY_ID={{%STUDY_ID%}}&SESSION_ID={{%SESSION_ID%}}
+  PROLIFIC: {
+    COMPLETION_CODE: "EDIT_ME",     // ← EDIT ME (from Prolific "Completion paths")
+    COMPLETION_URL: "https://app.prolific.com/submissions/complete?cc=",
+    AUTO_REDIRECT_SEC: 0,           // 0 = participant clicks "Return to Prolific"
+  },
+
+  // Smaller screens (phones, tablets) are turned away.
   MIN_SCREEN_WIDTH: 900,
   MIN_SCREEN_HEIGHT: 500,
 
-  // ── Emotional Stroop with colour words (4 keys) ───────────────────────
-  // One test run = 12 congruent colour words (RED in red) + 12 incongruent
-  // colour words (RED in blue) + 16 negative + 16 positive + 16 neutral
-  // words = 72 trials. Measures: Stroop interference (incongruent −
-  // congruent) and emotional interference (negative/positive − neutral).
-  STROOP: {
-    N_PRACTICE_TRIALS: 12,     // "XXXXX" strings before the first run only (multiple of 4)
-    N_CONGRUENT: 12,           // multiple of 4: each colour word equally often in its own ink
-    N_INCONGRUENT: 12,         // multiple of 12: each colour word equally often in each of the 3 other inks
-    WORDS_PER_EMOTION: 16,     // per category (negative/positive/neutral); multiple of 4, ≤ 20
-    FIXATION_DUR: 500,
-    WORD_TIMEOUT: 2000,
-    FEEDBACK_DUR: 500,         // practice feedback / test post-response fixation
-    ITI_DUR: 500,
-    MAX_INK_RUN: 2,            // same ink (= same correct key) at most 2 trials in a row
-    MAX_TYPE_RUN: 3,           // same trial type at most 3 in a row
+  // ── ORDER OF THE EXPERIMENT ───────────────────────────────────────────
+  // Each entry is one step. Re-order or remove steps here. Each step id may
+  // appear only once: to run a task again, give it a new name (e.g.
+  // "stroop:follow_up", "vas:follow_up") and add that new phase / timepoint
+  // name to PHASES / VAS_TIMEPOINTS in js/summary.js and analysis/analyze.py.
+  //   consent, demographics, setup   forms (always keep consent first)
+  //   intro                          "before you start" screen (average-performance rule)
+  //   stroop:<phase>                 colour–word task; the FIRST Stroop step run
+  //                                  includes the instructions + practice
+  //   vas:<timepoint>                "how do you feel" ratings; the image question
+  //                                  is added at the timepoints in VAS.IMAGE_QUESTION_AT
+  //   mist_baseline                  self-paced arithmetic practice → sets the MIST time limit
+  //   mist                           MIST stressor (timed, performance bar, noise)
+  //   images                         image intervention (the participant's condition)
+  //   blank                          rest screen (REST below)
+  //   feedback                       end questionnaire
+  // To test parts on their own, open debug.html (no need to edit this list).
+  FLOW: [
+    "consent",
+    "demographics",
+    "setup",
+    "intro",
+    "stroop:baseline",
+    "vas:pre_mist",
+    "mist_baseline",
+    "mist",
+    "vas:post_mist",
+    "stroop:post_stress",
+    "vas:pre_images",
+    "images",
+    "blank",
+    "vas:post_recovery",
+    "stroop:post_recovery",
+    "feedback",
+  ],
+
+  // ── Browser integrity (full screen, tab switches, focus) ──────────────
+  // Everything is recorded whatever these say (see "integrity" in the data file).
+  INTEGRITY: {
+    // Between two trials of the Stroop and MIST, pause and ask the participant
+    // to go back to full screen if they left it (the pause is recorded).
+    REQUIRE_FULLSCREEN_BETWEEN_TRIALS: true,
   },
 
+  // ── Stroop: traditional colour–word MATCH task, 2 keys ─────────────────
+  // A colour word (RED, GREEN, BLUE, YELLOW) appears in a coloured ink.
+  // Does the ink colour match the word?  match key = yes,  mismatch key = no.
+  //   congruent   = RED in red     → correct answer "match"
+  //   incongruent = RED in blue    → correct answer "mismatch"
+  STROOP: {
+    KEYS: { match: "left", mismatch: "right" },  // "left" / "right" = arrow keys
+    COUNTERBALANCE_KEYS: false,  // true = half the participants get the keys swapped (random)
+    N_PRACTICE_TRIALS: 12,       // with feedback, first Stroop run only (half congruent)
+    N_CONGRUENT: 36,             // multiple of 4: each colour word equally often in its own ink
+    N_INCONGRUENT: 36,           // multiple of 12: each word equally often in each of the 3 other inks
+    FIXATION_DUR: 500,
+    WORD_TIMEOUT: 2000,          // the word stays until a key press or this long
+    FEEDBACK_DUR: 500,           // practice feedback / test post-response fixation
+    ITI_DUR: 500,
+    MAX_INK_RUN: 2,              // same ink at most 2 trials in a row
+    MAX_TYPE_RUN: 3,             // same answer (match / mismatch) at most 3 in a row
+  },
+
+  // ── MIST baseline (calibration), the classic way ──────────────────────
+  // Dedovic et al. (2005): a practice block WITHOUT time limit, performance
+  // bar or noise. The participant's average time to solve a problem sets the
+  // starting time limit of the MIST stressor: TIME_LIMIT_FACTOR × average
+  // (0.9 = "10 % less than their average"), kept within MIST.MIN/MAX_TIME_LIMIT.
+  MIST_BASELINE: {
+    N_TRIALS: 15,
+    MAX_TRIAL_S: 30,          // hidden safety cap per problem (someone who walks away); not shown
+    SHOW_FEEDBACK: true,      // "Correct" / "Incorrect" after each answer
+    STATISTIC: "mean",        // "mean" or "median" of the correct answers' times
+    TIME_LIMIT_FACTOR: 0.9,
+    MIN_CORRECT: 3,           // fewer correct answers → use MIST.TIME_LIMIT instead
+  },
+
+  // ── MIST stressor ─────────────────────────────────────────────────────
   MIST: {
-    // Online there is no session-1 staircase, so every participant gets the
-    // same starting level and time limit (mist_l5.py standalone defaults).
-    LEVEL: 4,                // 3, 4 or 5 (5 adds integer division)
-    N_PRACTICE_TRIALS: 5,
+    LEVEL: 4,                // 3, 4 or 5 (5 adds integer division); baseline uses the same level
+    N_PRACTICE_TRIALS: 0,    // optional timed practice before the stressor (the baseline is the practice)
     N_EXP_TRIALS: 35,
-    // Adaptive time limit (experimental trials). It changes only after
-    // ADAPTIVE_WINDOW answers IN A ROW of the same kind — 3 correct → 10 %
-    // less time, 3 wrong/too slow → 10 % more — and the count starts again
-    // after every change, so a 4th miss alone does not add more time.
-    // Always kept between MIN_TIME_LIMIT and MAX_TIME_LIMIT.
-    // (The lab code re-checked after every trial with no limits, so the
-    // timer could climb to 10–20 s for someone who stopped answering.)
-    TIME_LIMIT: 5.0,         // starting limit, seconds
+    // Starting time limit if there is no baseline result (seconds).
+    TIME_LIMIT: 5.0,
     MIN_TIME_LIMIT: 2.5,
     MAX_TIME_LIMIT: 7.0,
+    // Adaptive: 3 correct in a row → 10 % less time; 3 wrong / too slow in a
+    // row → 10 % more (the count restarts after every change).
     ADAPTIVE_WINDOW: 3,
     ADAPTIVE_STEP: 0.10,
     TARGET_ACCURACY: 0.85,   // "group average" marker on the performance bar
-    // After each answer: CORRECT / INCORRECT / Too Slow! for FEEDBACK_DUR,
-    // then a blank screen for GAP_AFTER_FEEDBACK, so the next problem appears
-    // 2 s after the feedback. Fixed for every trial. (The lab's adaptive pause
-    // was 0.5–3 s and longest after the fastest answers.)
     FEEDBACK_DUR: 500,
     GAP_AFTER_FEEDBACK: 1500,
     WHITE_NOISE: true,
-    WHITE_NOISE_VOLUME: 0.1, // 0–1, same as the lab
+    WHITE_NOISE_VOLUME: 0.1, // 0–1
   },
 
-  // ── Image intervention (image_viewing.py) ─────────────────────────────
-  // Each participant sees N_IMAGES images drawn at random, IMAGE_DURATION
-  // each with no gap: 120 × 2.5 s = 5 min, as in the lab.
-  //
-  // Pool (js/image_list.js): by default only the full-HD widescreen (16:9)
-  // Positive Prime images — 446 of the 920; the 4:3 / 3:2 ones are mostly
-  // ~1000 px wide and look soft on a laptop. MIX_OTHER_FRACTION > 0 mixes in
-  // that share of the other images (e.g. 0.2 → 24 of 120).
-  //
-  // Fit: an image whose shape is within COVER_TOLERANCE of the screen's
-  // fills the screen (at most a thin strip trimmed: a 16:9 image on a 16:10
-  // MacBook loses ~5 % at each side). Any other shape is shown whole, with
-  // the empty side areas filled by a blurred copy of the same image — never
-  // cropped, never grey bars.
-  //
-  // Resolution: TIER "auto" picks images/1920/ for screens of at least
-  // 1600 × 900 physical pixels and images/1280/ for smaller ones.
+  VAS: {
+    IMAGE_QUESTION_AT: ["post_recovery"],  // timepoints that also ask "How did the images make you feel?"
+  },
+
+  // ── Image intervention: one condition per participant ─────────────────
+  // Folder layout:  images/<folder>/  (flat), or images/<folder>/1280/ +
+  // images/<folder>/1920/ (two sizes; the right one is picked per screen).
+  // After adding/removing image files or folders, run
+  //   tools/build_image_manifest.bat   (or: node tools/build_image_manifest.js)
+  // which rewrites js/image_manifest.js (the list of files the browser uses).
+  // To add a condition: put the images in images/<name>/, run the tool, add
+  // an entry below and add its name to ASSIGN_FROM.
   IMAGES: {
-    DIR: "images/",
+    ROOT: "images/",
+    CONDITIONS: {
+      positive_prime: { label: "Positive Prime", folder: "positive_prime" },
+      positive:       { label: "Positive",       folder: "positive" },
+      negative:       { label: "Negative",       folder: "negative" },
+      neutral:        { label: "Neutral",        folder: "neutral" },
+    },
+    // Each participant gets ONE of these at random (equal chances). A
+    // participant who reopens the link in the same browser keeps theirs.
+    // ?condition=<name> in the study URL forces one (e.g. a separate Prolific
+    // study per condition, for exactly balanced groups).
+    ASSIGN_FROM: ["positive_prime", "positive", "negative", "neutral"],
+
     N_IMAGES: 120,
-    IMAGE_DURATION: 2500,
+    IMAGE_DURATION: 2500,      // 120 × 2.5 s = 5 min, no gap
+    REPEAT_IF_FEWER: true,     // a set with fewer than N_IMAGES files is cycled (reshuffled) to fill
+    // Preference for full-HD 16:9 pictures ("wide" + "hd" in the manifest):
+    // they are used first; MIX_OTHER_FRACTION > 0 mixes in that share of the
+    // other shapes. Sets without such pictures simply use the others.
     MIX_OTHER_FRACTION: 0,
-    COVER_TOLERANCE: 0.12,
-    TIER: "auto",            // "auto" | "1280" | "1920"
-    PRELOAD_TIMEOUT: 120000, // max wait for the images to finish loading before the block
-    LOAD_RETRIES: 3,         // retries of the same file (with back-off) before using a spare
+    COVER_TOLERANCE: 0.12,     // image shape within 12 % of the screen's → fill the screen
+    TIER: "auto",              // two-size sets: "auto" | "1280" | "1920"
+    PRELOAD_TIMEOUT: 120000,   // max wait for the images before the block
+    LOAD_RETRIES: 3,
   },
 
-  // Fixation cross after the images, before the post-recovery VAS.
-  REST_DURATION: 60000,
+  // ── Rest after the images ─────────────────────────────────────────────
+  REST: {
+    DURATION: 60000,
+    SHOW_FIXATION: false,      // false = plain blank screen, true = a "+" in the middle
+  },
 };
 
-// ?quick=1 shortens every block for a fast run-through while piloting. The
-// session is flagged quick_mode=1 in the data so it is easy to exclude.
+// ?quick=1 shortens every block for a fast run-through (flagged quick_mode=1).
+// Ignored for real Prolific participants (a PROLIFIC_PID in the link) unless debug=1.
+// ── EDIT HERE ── to change how short "quick" runs are.
 (function applyQuickMode() {
   const p = new URLSearchParams(location.search);
   if (p.get("quick") !== "1") return;
+  const pid = p.get("PROLIFIC_PID") || "";
+  if (pid && !/[{%]/.test(pid) && p.get("debug") !== "1") return;
   const c = window.CONFIG;
   c.QUICK_MODE = true;
   c.STROOP.N_PRACTICE_TRIALS = 4;
   c.STROOP.N_CONGRUENT = 4;
   c.STROOP.N_INCONGRUENT = 12;
-  c.STROOP.WORDS_PER_EMOTION = 4;
-  c.MIST.N_PRACTICE_TRIALS = 2;
+  c.MIST_BASELINE.N_TRIALS = 4;
+  c.MIST_BASELINE.MIN_CORRECT = 2;
   c.MIST.N_EXP_TRIALS = 5;
   c.IMAGES.N_IMAGES = 6;
-  c.REST_DURATION = 5000;
+  c.REST.DURATION = 5000;
 })();

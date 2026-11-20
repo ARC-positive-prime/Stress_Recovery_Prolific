@@ -1,10 +1,11 @@
 /*
- * Core engine: timing, keyboard, screens, event log, data-quality tracking
- * and data upload. Shared by every task.
+ * Core engine: timing, keyboard, screens, event log, browser-integrity
+ * tracking (full screen / tab switches / focus) and the debug "skip" switch.
+ * Shared by every task. You should not need to edit this file.
  *
  * Timing
  *   Stimuli are drawn inside a requestAnimationFrame callback, and the onset
- *   is the timestamp of the NEXT frame — the closest a browser gets to
+ *   is the timestamp of the NEXT frame: the closest a browser gets to
  *   PsychoPy's flip-locked onset. RTs are keydown event.timeStamp − onset;
  *   both are on the performance.now() clock, so RT precision is ~1 ms plus
  *   keyboard latency (typically 5–30 ms on laptops, constant within a person,
@@ -18,12 +19,17 @@
   const now = () => performance.now();
   const sec = (ms) => Math.round(ms) / 1000; // ms → s, 3 dp
   const iso = () => new Date().toISOString();
+  const r2 = (x) => Math.round(x * 100) / 100;
+
+  // Fill {PLACEHOLDERS} in a text from js/texts.js.
+  function fill(text, vars = {}) {
+    return String(text).replace(/\{([A-Z_]+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  }
 
   // Draw `render` on the next frame; resolve with the timestamp of the frame
-  // after that, i.e. when the drawn frame reached the screen.
-  // Also records the duration of the frame that carried the stimulus
-  // (Core.lastFrameMs): ≈ 1000/refresh normally, larger if a frame was
-  // dropped at onset. Tasks save it per trial as `onset_frame_ms`.
+  // after that, i.e. when the drawn frame reached the screen. Also records
+  // the duration of the frame that carried the stimulus (Core.lastFrameMs):
+  // ≈ 1000/refresh normally, larger if a frame was dropped at onset.
   async function present(render) {
     const t1 = await frame();
     render();
@@ -42,12 +48,38 @@
   }
   const choice = (a) => a[Math.floor(Math.random() * a.length)];
 
+  // ── Debug skip (only active in debug mode, see js/debug.js) ────────────
+  // Pressing F2 in debug mode sets Skip.requested: key waits resolve at once,
+  // task loops stop at the next trial, so the current step ends quickly.
+  // main.js resets it at the start of every step.
+  const Skip = {
+    enabled: false,
+    requested: false,
+    _waiters: [],
+    request() {
+      if (!this.enabled) return;
+      this.requested = true;
+      const w = this._waiters; this._waiters = [];
+      w.forEach((r) => r());
+    },
+    reset() { this.requested = false; },
+    promise() {
+      return new Promise((r) => (this.requested ? r() : this._waiters.push(r)));
+    },
+  };
+
+  // Sleep that ends early when a debug skip is requested (long waits only).
+  const wait = (ms) => (Skip.enabled ? Promise.race([sleep(ms), Skip.promise()]) : sleep(ms));
+
   // ── Keyboard ───────────────────────────────────────────────────────────
   // Physical-key names, matching PsychoPy key names used in the originals.
   function keyName(e) {
     if (/^[0-9]$/.test(e.key)) return e.key;
-    // Letters: the letter printed on the key (works on QWERTY, AZERTY,
-    // QWERTZ, Dvorak, Colemak …); non-Latin layouts fall back to position.
+    // Arrow keys first: the numpad arrows (NumLock off) have e.code Numpad4/6.
+    const ARROWS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+    if (ARROWS[e.key]) return ARROWS[e.key];
+    // Letters: the letter printed on the key (works on any Latin layout);
+    // non-Latin layouts fall back to position.
     if (e.key && /^[a-zA-Z]$/.test(e.key)) return e.key.toLowerCase();
     const c = e.code || "";
     if (/^Key[A-Z]$/.test(c)) return c.slice(3).toLowerCase();
@@ -55,10 +87,14 @@
     switch (c) {
       case "ArrowLeft": return "left";
       case "ArrowRight": return "right";
+      case "ArrowUp": return "up";
+      case "ArrowDown": return "down";
       case "Space": return "space";
       case "Enter": case "NumpadEnter": return "return";
       case "Backspace": return "backspace";
     }
+    if (e.key === "ArrowLeft") return "left";
+    if (e.key === "ArrowRight") return "right";
     if (e.key === " ") return "space";
     if (e.key === "Enter") return "return";
     if (e.key === "Backspace") return "backspace";
@@ -75,34 +111,38 @@
   /*
    * Wait for one of `keys`. With `timeout` (ms), resolves {timedOut:true}
    * if nothing arrives within `timeout` of `onset` (or of the call).
-   * Returns {key, t, rt (s from onset), timedOut}.
+   * Returns {key, t, rt (s from onset), timedOut, skipped}.
    */
   function waitForKey(keys, opts = {}) {
     const { timeout = null, onset = null, onKey = null } = opts;
     const t0 = onset != null ? onset : now();
     return new Promise((resolve) => {
       let timer = null;
+      let finished = false;
       const done = (val) => {
+        if (finished) return;
+        finished = true;
         window.removeEventListener("keydown", handler, true);
         if (timer) clearTimeout(timer);
         resolve(val);
       };
       function handler(e) {
         const k = keyName(e);
-        if (["space", "left", "right", "backspace"].includes(k)) e.preventDefault();
+        if (["space", "left", "right", "up", "down", "backspace"].includes(k)) e.preventDefault();
         if (e.repeat || !keys.includes(k)) return;
         const t = eventTime(e);
         if (timeout != null && t - t0 > timeout) return; // arrived after deadline
         if (onKey && onKey(k, t) === false) return;      // consumed, keep waiting
-        done({ key: k, t, rt: (t - t0) / 1000, timedOut: false });
+        done({ key: k, t, rt: (t - t0) / 1000, timedOut: false, skipped: false });
       }
       window.addEventListener("keydown", handler, true);
       if (timeout != null) {
         timer = setTimeout(
-          () => done({ key: null, t: null, rt: null, timedOut: true }),
+          () => done({ key: null, t: null, rt: null, timedOut: true, skipped: false }),
           Math.max(0, t0 + timeout - now())
         );
       }
+      if (Skip.enabled) Skip.promise().then(() => done({ key: null, t: null, rt: null, timedOut: true, skipped: true }));
     });
   }
 
@@ -132,6 +172,9 @@
   }
 
   // Full-screen instruction text (PsychoPy-style) that waits for SPACE.
+  // opts.minMs: SPACE is ignored for this long, so key screens can't be
+  // skipped unread by a double key press. Every screen's display time is
+  // logged (Session event "instructions", detail = {screen, shown_s}).
   async function instructions(text, opts = {}) {
     showStage();
     await ensureFullscreen();
@@ -140,7 +183,10 @@
     box.textContent = text;
     if (opts.extra) box.appendChild(opts.extra);
     await frame();
-    await waitForKey(opts.keys || ["space"]);
+    const t0 = now();
+    const minMs = opts.minMs || 0;
+    await waitForKey(opts.keys || ["space"], { onKey: () => now() - t0 >= minMs });
+    Events.log("Session", 0, "instructions", JSON.stringify({ screen: String(text).split("\n")[0].slice(0, 60), shown_s: sec(now() - t0) }));
     clearStage();
   }
 
@@ -154,243 +200,213 @@
     !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
   const isFullscreen = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
 
+  // Resolves once the browser is in full screen, or after about 1 s if it
+  // is not (old Safari's webkitRequestFullscreen enters full screen later).
   async function requestFullscreen() {
     const d = document.documentElement;
+    const changed = new Promise((r) => {
+      const h = () => { document.removeEventListener("fullscreenchange", h); document.removeEventListener("webkitfullscreenchange", h); r(); };
+      document.addEventListener("fullscreenchange", h);
+      document.addEventListener("webkitfullscreenchange", h);
+    });
     try {
       if (d.requestFullscreen) await d.requestFullscreen({ navigationUI: "hide" });
       else if (d.webkitRequestFullscreen) d.webkitRequestFullscreen();
-    } catch (_) { /* denied — carry on windowed */ }
+    } catch (_) { /* denied: carry on windowed */ }
+    if (!isFullscreen()) await Promise.race([changed, sleep(1000)]);
   }
 
-  // Between blocks, ask the participant to go back to full screen if they
-  // left it. Needs a click (browsers only allow fullscreen on a gesture).
-  function ensureFullscreen() {
-    if (!fsSupported() || isFullscreen() || Core.fullscreenDeclined) return Promise.resolve();
+  // Ask the participant to go back to full screen if they left it. Needs a
+  // click (browsers only allow full screen on a user gesture). Each prompt
+  // and how long it took is recorded (integrity + Browser events).
+  // opts.resume: after the click, also wait for SPACE ("ready to continue"),
+  // so a timed trial does not start while the hand is still on the mouse.
+  function ensureFullscreen(opts = {}) {
+    if (!fsSupported() || isFullscreen() || Core.fullscreenDeclined) return Promise.resolve(false);
+    Integrity.prompt();
+    const shownAt = now();
     return new Promise((resolve) => {
       const ov = el("div", "overlay", null, document.body);
       const card = el("div", "overlay-card", null, ov);
       el("p", null, "The study needs to run in full screen. Please click the button to continue.", card);
       const btn = el("button", "btn", "Return to full screen", card);
       btn.onclick = async () => {
+        btn.disabled = true;
         await requestFullscreen();
-        if (!isFullscreen()) Core.fullscreenDeclined = true; // browser refused
+        if (!isFullscreen()) { Core.fullscreenDeclined = true; Integrity.declined = 1; } // browser refused
+        Events.log("Browser", 0, "fullscreen_prompt_closed", JSON.stringify({ waited_s: sec(now() - shownAt), fullscreen: Number(isFullscreen()) }));
+        if (opts.resume) {
+          card.innerHTML = "";
+          el("p", null, "Thank you. Put your hands back on the keyboard and press SPACE to continue.", card);
+          await waitForKey(["space"]);
+        }
         ov.remove();
-        resolve();
+        resolve(true);
       };
     });
+  }
+
+  // Called by the Stroop and MIST before every trial.
+  function betweenTrials() {
+    const I = window.CONFIG && CONFIG.INTEGRITY;
+    if (I && I.REQUIRE_FULLSCREEN_BETWEEN_TRIALS) return ensureFullscreen({ resume: true });
+    return Promise.resolve();
   }
 
   // ── Event-marker log (same codes as the LSL triggers in the lab) ────────
   const Events = {
     rows: [],
     log(stream, code, label, extra) {
+      const D = window.Core && window.Core.Data;
       const r = {
-        participant_id: Data.pid, session: Data.session, phase: Core.phase || "",
+        participant_id: D ? D.pid : "", session: D ? D.session : 1,
+        step: (window.Core && Core.step) || "", phase: (window.Core && Core.phase) || "",
         stream, code, label, time: sec(now()), wall_time: iso(),
       };
-      if (extra) r.detail = extra;
+      if (extra != null) r.detail = extra;
       this.rows.push(r);
     },
-    take() { const r = this.rows; this.rows = []; return r; },
   };
 
-  // ── Data-quality tracking ──────────────────────────────────────────────
-  // `trialFlags.focusLost` is set if the page lost focus or was hidden at
-  // any point during the current trial; tasks copy it into each row.
-  const Quality = {
-    blurCount: 0, hiddenCount: 0, fullscreenExits: 0,
-    trialFlags: { focusLost: false },
-    resetTrial() { this.trialFlags.focusLost = false; },
+  // ── Browser integrity: full screen, tab switches, focus ────────────────
+  // Everything is recorded three ways:
+  //   1. Events (stream "Browser"): every change with a timestamp;
+  //   2. integrity section of the data file: counts, total durations, the
+  //      same per step (by_step) and a list of incidents with durations;
+  //   3. per trial: focus_lost = 1 if any of this happened during the trial,
+  //      fullscreen = 1 if in full screen at the end of the trial.
+  const MAX_INCIDENTS = 1000;
+  const Integrity = {
+    counts: { fullscreen_exit_count: 0, tab_hidden_count: 0, window_blur_count: 0, fullscreen_return_prompts: 0 },
+    totals: { time_outside_fullscreen_s: 0, time_hidden_s: 0, time_blurred_s: 0 },
+    byStep: {},
+    incidents: [],
+    open: {},             // type → open incident (not yet ended)
+    declined: 0,
+    unsupported: 0,       // 1 = this browser has no full-screen API at all
+    nIncidents: 0,
+    fsEverEntered: false,
+
+    stepEntry(step) {
+      const k = step || "(none)";
+      return (this.byStep[k] = this.byStep[k] || {
+        fullscreen_exit_count: 0, tab_hidden_count: 0, window_blur_count: 0,
+        fullscreen_return_prompts: 0, time_outside_fullscreen_s: 0, time_hidden_s: 0, time_blurred_s: 0,
+      });
+    },
+    begin(type, countKey) {
+      if (this.open[type]) return;  // already open
+      this.counts[countKey]++;
+      this.stepEntry(Core.step)[countKey]++;
+      const inc = {
+        type, step: Core.step || "", phase: Core.phase || "",
+        during_task: Number(document.body.classList.contains("task-mode")),
+        start: iso(), end: null, start_time_s: sec(now()), duration_s: null,
+        _t0: now(),
+      };
+      this.open[type] = inc;
+      this.nIncidents++;
+      if (this.incidents.length < MAX_INCIDENTS) this.incidents.push(inc);
+    },
+    end(type, totalKey) {
+      const inc = this.open[type];
+      if (!inc) return;
+      delete this.open[type];
+      const d = (now() - inc._t0) / 1000;
+      inc.end = iso();
+      inc.duration_s = r2(d);
+      this.totals[totalKey] += d;
+      this.stepEntry(inc.step)[totalKey] += d;
+    },
+    prompt() {
+      this.counts.fullscreen_return_prompts++;
+      this.stepEntry(Core.step).fullscreen_return_prompts++;
+      Events.log("Browser", 0, "fullscreen_prompt");
+    },
+    // Snapshot for the data file (open incidents counted up to now).
+    report() {
+      const totals = { ...this.totals };
+      const byStep = JSON.parse(JSON.stringify(this.byStep));
+      const KEY = { fullscreen_exit: "time_outside_fullscreen_s", tab_hidden: "time_hidden_s", window_blur: "time_blurred_s" };
+      for (const [type, inc] of Object.entries(this.open)) {
+        const d = (now() - inc._t0) / 1000;
+        totals[KEY[type]] += d;
+        const s = byStep[inc.step || "(none)"];
+        if (s) s[KEY[type]] += d;
+      }
+      for (const s of Object.values(byStep)) for (const k of Object.values(KEY)) s[k] = r2(s[k]);
+      const out = { ...this.counts, fullscreen_declined: this.declined, fullscreen_unsupported: this.unsupported };
+      for (const [k, v] of Object.entries(totals)) out[k] = r2(v);
+      out.by_step = byStep;
+      out.incidents_total = this.nIncidents;
+      out.incidents_truncated = Number(this.nIncidents > this.incidents.length);
+      // Incidents still going on now: duration so far, marked open = 1.
+      out.incidents = this.incidents.map(({ _t0, ...rest }) =>
+        rest.end == null ? { ...rest, open: 1, duration_s: r2((now() - _t0) / 1000) } : rest);
+      return out;
+    },
   };
+
+  // Per-trial flag: tasks reset it at trial start and copy it into each row.
+  const Quality = {
+    trialFlags: { focusLost: false },
+    // A trial starts as "focus lost" if the window is still unfocused, hidden
+    // or out of full screen from before; otherwise any new incident sets it.
+    resetTrial() {
+      this.trialFlags.focusLost = Object.keys(Integrity.open).length > 0 || document.hidden ||
+        (typeof document.hasFocus === "function" && !document.hasFocus());
+    },
+    get blurCount() { return Integrity.counts.window_blur_count; },
+    get hiddenCount() { return Integrity.counts.tab_hidden_count; },
+    get fullscreenExits() { return Integrity.counts.fullscreen_exit_count; },
+  };
+
   window.addEventListener("blur", () => {
-    Quality.blurCount++; Quality.trialFlags.focusLost = true;
+    Quality.trialFlags.focusLost = true;
+    Integrity.begin("window_blur", "window_blur_count");
     Events.log("Browser", 0, "window_blur");
   });
-  window.addEventListener("focus", () => Events.log("Browser", 0, "window_focus"));
+  window.addEventListener("focus", () => {
+    Integrity.end("window_blur", "time_blurred_s");
+    Events.log("Browser", 0, "window_focus");
+  });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { Quality.hiddenCount++; Quality.trialFlags.focusLost = true; }
+    if (document.hidden) {
+      Quality.trialFlags.focusLost = true;
+      Integrity.begin("tab_hidden", "tab_hidden_count");
+    } else {
+      Integrity.end("tab_hidden", "time_hidden_s");
+    }
     Events.log("Browser", 0, document.hidden ? "tab_hidden" : "tab_visible");
   });
+  let studyExit = false;   // the study itself is leaving full screen (before the feedback form)
   const onFs = () => {
-    if (!isFullscreen()) { Quality.fullscreenExits++; Quality.trialFlags.focusLost = true; }
-    Events.log("Browser", 0, isFullscreen() ? "fullscreen_enter" : "fullscreen_exit");
+    if (isFullscreen()) {
+      Integrity.fsEverEntered = true;
+      Integrity.end("fullscreen_exit", "time_outside_fullscreen_s");
+    } else if (Integrity.fsEverEntered && !studyExit) {
+      Quality.trialFlags.focusLost = true;
+      Integrity.begin("fullscreen_exit", "fullscreen_exit_count");
+    }
+    Events.log("Browser", 0, isFullscreen() ? "fullscreen_enter" : "fullscreen_exit", !isFullscreen() && studyExit ? "by_study" : undefined);
+    if (!isFullscreen()) studyExit = false;
   };
   document.addEventListener("fullscreenchange", onFs);
   document.addEventListener("webkitfullscreenchange", onFs);
 
-  // ── Data store + upload ────────────────────────────────────────────────
-  //
-  // Rows reach the server three ways, so whatever a participant did is kept
-  // wherever they stop:
-  //   save(sheet, rows)  — upload a batch now (end of a section, forms).
-  //   stream(sheet, row) — trial rows as they happen; uploaded every
-  //                        STREAM_CHUNK rows, the rest at the end of the
-  //                        section (flushStreams) or when the page closes.
-  //   quitFlush()        — on page close (pagehide): uploads everything not
-  //                        yet confirmed, plus a "quit" summary row from
-  //                        Data.onQuit, with fetch keepalive (best effort).
-  // Every row carries page_load_id (random per page load). Each batch has a
-  // batch_id; a batch sent twice (retry, or normal send + quit send) is
-  // stored once (the receiver ignores repeated batch_ids).
-  const LS_KEY = "stress_recovery_prolific_backup";
-  const STREAM_CHUNK = 10;
-  const KEEPALIVE_BUDGET = 60000;  // bytes; browsers cap keepalive bodies at ~64 KB in total
-
-  function randomCode(n) {
-    const a = new Uint8Array(n);
-    crypto.getRandomValues(a);
-    return Array.from(a, (b) => b.toString(36).padStart(2, "0")).join("").toUpperCase().slice(0, n);
-  }
-
-  const Data = {
-    pid: "", session: 1, task: "stroop", attempt: 1,
-    loadId: randomCode(8),
-    store: {},     // sheet → all rows saved so far (local copy of everything)
-    buffers: {},   // sheet → streamed rows not yet saved
-    pending: [],   // batches not yet confirmed by the server
-    uploading: Promise.resolve(),
-    finished: false,  // set once the final summary is saved (no "quit" row after that)
-    onQuit: null,     // () => [[sheet, rows], …] extra rows to send if the page closes early
-
-    save(sheet, rows) {
-      if (!rows || !rows.length) return this.uploading;
-      rows = rows.map((r) => ({ ...r, page_load_id: this.loadId }));
-      (this.store[sheet] = this.store[sheet] || []).push(...rows);
-      this.backup();
-      const batch = { batch_id: `${this.pid}-${sheet}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, sheet, rows };
-      this.pending.push(batch);
-      // Chain uploads so batches go one at a time, in order.
-      this.uploading = this.uploading.then(() => this.trySend(batch));
-      return this.uploading;
-    },
-
-    stream(sheet, row) {
-      const buf = (this.buffers[sheet] = this.buffers[sheet] || []);
-      buf.push(row);
-      if (buf.length >= STREAM_CHUNK) this.save(sheet, buf.splice(0));
-    },
-
-    flushStreams() {
-      for (const sheet of Object.keys(this.buffers)) {
-        const buf = this.buffers[sheet];
-        if (buf.length) this.save(sheet, buf.splice(0));
-      }
-    },
-
-    // Every row of a sheet so far, saved or still buffered.
-    all(sheet) {
-      return (this.store[sheet] || []).concat(this.buffers[sheet] || []);
-    },
-
-    async trySend(batch, attempts = 3, timeoutMs = 20000) {
-      if (!CONFIG.DATA_URL) return false;
-      for (let i = 0; i < attempts; i++) {
-        if (!this.pending.includes(batch)) return true;   // already confirmed by another send
-        try {
-          const res = await fetchWithTimeout(CONFIG.DATA_URL, {
-            method: "POST",
-            // text/plain keeps this a CORS "simple request" (no preflight).
-            headers: { "Content-Type": "text/plain;charset=utf-8" },
-            body: JSON.stringify({ action: "append", participant_id: this.pid, ...batch }),
-          }, timeoutMs);
-          const j = await res.json();
-          if (j.ok) {
-            this.pending = this.pending.filter((b) => b !== batch);
-            this.backup();
-            return true;
-          }
-          console.warn("Upload rejected", j);
-        } catch (err) {
-          console.warn("Upload failed", err);
-        }
-        if (i < attempts - 1) await sleep(1000 * (i + 1) * 2);
-      }
-      return false;
-    },
-
-    /*
-     * Upload everything still pending, giving up after deadlineMs so a
-     * participant with a dead connection is not left on the "Saving…"
-     * screen for minutes. True when nothing is left.
-     */
-    async flush(deadlineMs = 45000) {
-      this.flushStreams();
-      if (!CONFIG.DATA_URL) return false;
-      const end = now() + deadlineMs;
-      await Promise.race([this.uploading, sleep(deadlineMs)]);
-      while (this.pending.length && now() < end - 1000) {
-        for (const b of [...this.pending]) {
-          const left = end - now();
-          if (left < 1000) break;
-          await this.trySend(b, 1, Math.min(15000, left));
-        }
-        if (this.pending.length && now() < end - 2500) await sleep(1500);
-      }
-      return this.pending.length === 0;
-    },
-
-    // Page is closing: send what is not yet confirmed (best effort).
-    quitFlush() {
-      try {
-        if (!this.finished && this.onQuit) {
-          for (const [sheet, rows] of this.onQuit() || []) this.save(sheet, rows);
-        }
-      } catch (e) { console.warn("onQuit failed", e); }
-      this.flushStreams();
-      const ev = Events.take();
-      if (ev.length) this.save("events", ev);
-      this.backup();
-      if (!CONFIG.DATA_URL || !this.pending.length) return;
-      // Small, important batches first; the event log last.
-      const rank = (b) => (b.sheet === "summary" || b.sheet === "sessions" ? 0 : b.sheet === "events" ? 2 : 1);
-      let budget = KEEPALIVE_BUDGET;
-      for (const b of [...this.pending].sort((x, y) => rank(x) - rank(y))) {
-        const body = JSON.stringify({ action: "append", participant_id: this.pid, ...b });
-        const size = new TextEncoder().encode(body).length;
-        if (size > budget) continue;
-        budget -= size;
-        try {
-          fetch(CONFIG.DATA_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body, keepalive: true })
-            .catch(() => {});
-        } catch (_) { /* nothing more we can do */ }
-      }
-    },
-
-    // Tell the server this participant finished (completion log + dashboard).
-    async markComplete() {
-      if (!CONFIG.DATA_URL) return;
-      try {
-        await fetchWithTimeout(CONFIG.DATA_URL, {
-          method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
-          body: JSON.stringify({ action: "complete", participant_id: this.pid }),
-        }, 15000);
-      } catch (_) { /* not critical */ }
-    },
-
-    backup() {
-      try {
-        localStorage.setItem(LS_KEY, JSON.stringify({ pid: this.pid, saved: iso(), store: this.store, buffers: this.buffers, pendingCount: this.pending.length }));
-      } catch (_) { /* storage full / blocked — upload is the primary path */ }
-    },
-
-    downloadJSON() {
-      this.flushStreams();
-      const blob = new Blob([JSON.stringify({ participant_id: this.pid, exported: iso(), data: this.store }, null, 1)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `stress_recovery_${this.pid}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    },
-  };
-  window.addEventListener("pagehide", () => Data.quitFlush());
-
-  async function fetchWithTimeout(url, opts, ms) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), ms);
-    try { return await fetch(url, { ...opts, signal: ctl.signal, redirect: "follow" }); }
-    finally { clearTimeout(t); }
+  // Leave full screen on purpose (end of the tasks): not counted as an exit,
+  // and full-screen tracking stops until the participant enters it again.
+  async function exitFullscreen() {
+    // Tracking stops here: close an exit incident that is still open (the
+    // participant left full screen just before) and stop counting.
+    Integrity.end("fullscreen_exit", "time_outside_fullscreen_s");
+    if (!isFullscreen()) { Integrity.fsEverEntered = false; return; }
+    studyExit = true;
+    Integrity.fsEverEntered = false;
+    try {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } catch (_) { studyExit = false; }
   }
 
   // ── Device info ────────────────────────────────────────────────────────
@@ -404,17 +420,15 @@
     const median = s[Math.floor(s.length / 2)];
     const mean = d.reduce((a, b) => a + b, 0) / d.length;
     const sd = Math.sqrt(d.reduce((a, b) => a + (b - mean) ** 2, 0) / (d.length - 1));
-    const r2 = (x) => Math.round(x * 100) / 100;
     return {
       refresh_rate_hz: median > 0 ? Math.round(1000 / median) : null,
       frame_ms_median: r2(median), frame_ms_mean: r2(mean), frame_ms_sd: r2(sd),
       frames_dropped_pct: r2((100 * d.filter((x) => x > 1.5 * median).length) / d.length),
     };
   }
-  const estimateRefreshRate = async (n = 60) => (await measureFrames(n)).refresh_rate_hz;
 
   // Smallest step of performance.now() (browsers coarsen it: ~0.1 ms in
-  // Chrome/Edge, 1 ms in Firefox/Safari) — the floor of RT precision.
+  // Chrome/Edge, 1 ms in Firefox/Safari): the floor of RT precision.
   function timerResolution() {
     let best = Infinity;
     for (let i = 0; i < 50; i++) {
@@ -441,9 +455,9 @@
 
   // Everything about the display, timing and audio, measured once the page
   // is full screen (call after the participant clicks Start).
-  async function deviceInfo() {
+  async function deviceInfo(nFrames = 120) {
     const dpr = window.devicePixelRatio || 1;
-    const frames = await measureFrames(120);
+    const frames = await measureFrames(nFrames);
     const a = window.Core.audio;
     return {
       ...browserName(),
@@ -467,9 +481,9 @@
     };
   }
 
+  // ── IDs ────────────────────────────────────────────────────────────────
   // Prolific passes PROLIFIC_PID / STUDY_ID / SESSION_ID in the study URL.
-  // Unreplaced placeholders ("{{%PROLIFIC_PID%}}", e.g. when previewing the
-  // link) are ignored.
+  // Unreplaced placeholders ("{{%PROLIFIC_PID%}}") are ignored.
   function urlId(name) {
     const v = new URLSearchParams(location.search).get(name);
     if (!v || v.includes("{") || v.includes("%")) return "";
@@ -483,29 +497,24 @@
     };
   }
 
-  // Participant code: PROLIFIC_PID, else ?pid=, else a random code.
-  function newParticipantId() {
-    return identity().pid;
+  function randomCode(n) {
+    const a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return Array.from(a, (b) => b.toString(36).padStart(2, "0")).join("").toUpperCase().slice(0, n);
   }
 
   /*
    * Participant code + attempt number. If the same PROLIFIC_PID (or ?pid=)
    * opens the study again in the same browser after giving consent once,
-   * the code gets "(2)", "(3)", … appended, e.g. 5f01…345(2), so a restart
-   * is never mixed up with the first try. The attempt is counted (commit())
-   * only when consent is given, so reloading the consent page doesn't count.
-   * A restart in a different browser can't be seen here; rows still differ
-   * in page_load_id.
+   * the code gets "(2)", "(3)", … appended, so a restart is never mixed up
+   * with the first try. The attempt is counted (commit()) only when consent
+   * is given, so reloading the consent page doesn't count. A restart in a
+   * different browser can't be seen here; files still differ in page_load_id.
    */
   const ATTEMPT_KEY = "stress_recovery_prolific_attempts_";
-  function identity() {
+  function identity(prefix = "P") {
     const base = urlId("PROLIFIC_PID") || urlId("pid");
-    if (!base) {
-      const a = new Uint8Array(4);
-      crypto.getRandomValues(a);
-      const pid = "P" + Array.from(a, (b) => b.toString(36).padStart(2, "0")).join("").toUpperCase().slice(0, 7);
-      return { pid, base: "", attempt: 1, commit() {} };
-    }
+    if (!base) return { pid: prefix + randomCode(7), base: "", attempt: 1, commit() {} };
     let prev = 0;
     try { prev = parseInt(localStorage.getItem(ATTEMPT_KEY + base) || "0", 10) || 0; } catch (_) {}
     const attempt = prev + 1;
@@ -518,12 +527,14 @@
   }
 
   window.Core = {
-    sleep, frame, now, sec, iso, present, shuffle, choice,
+    sleep, wait, frame, now, sec, iso, fill, present, shuffle, choice, randomCode,
     keyName, waitForKey, showStage, showPage, clearStage, el, stage, page,
-    instructions, blank, requestFullscreen, ensureFullscreen, isFullscreen, fsSupported,
-    estimateRefreshRate, measureFrames, deviceInfo, newParticipantId, identity, prolificInfo, fetchWithTimeout,
+    instructions, blank, requestFullscreen, exitFullscreen, ensureFullscreen, betweenTrials, isFullscreen, fsSupported,
+    measureFrames, deviceInfo, identity, prolificInfo, urlId,
     lastFrameMs: null,
-    Events, Quality, Data,
-    phase: "", fullscreenDeclined: false,
+    Events, Integrity, Quality, Skip,
+    Data: null,          // set by js/data.js
+    audio: null,
+    step: "", phase: "", fullscreenDeclined: false,
   };
 })();

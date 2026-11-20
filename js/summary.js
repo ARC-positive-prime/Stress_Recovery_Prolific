@@ -1,25 +1,36 @@
 /*
- * Per-participant summary row (sheet "summary"), so results can be eyeballed
- * in the Sheet without analysis code. analysis/analyze.py recomputes
- * everything from the trial data with the same rules — treat the trial
- * sheets as the source of truth.
+ * Per-participant summary (the "summary" section of the data file), so
+ * results can be eyeballed without analysis code. analysis/analyze.py
+ * recomputes everything from the trial tables with the same rules: the trial
+ * tables are the source of truth.
  *
- * Stroop phases: baseline, post_stress, post_recovery. For each phase,
- * columns are prefixed with the phase name (baseline_mean_rt, …). Changes:
+ * Stroop phases: baseline, post_stress, post_recovery (columns prefixed with
+ * the phase). Changes:
  *   stress_*    = post_stress   − baseline       (effect of the stressor)
  *   recovery_*  = post_recovery − post_stress    (change after the images)
  *   net_*       = post_recovery − baseline       (back to baseline?)
+ * Rules: test (non-practice) trials only. RT measures use correct trials with
+ * rt ≥ 0.2 s. accuracy = correct / responded; accuracy_all = correct / all.
  *
- * Rules: measured (non-practice) trials only. RT measures use correct trials
- * with rt >= 0.2 s (faster = anticipation). accuracy = correct / responded;
- * accuracy_all = correct / all trials (misses count as errors).
+ * VAS timepoints: pre_mist, post_mist, pre_images, post_recovery.
+ *   vas_stress_change   = post_mist     − pre_mist     (stressor)
+ *   vas_task_change     = pre_images    − post_mist    (second Stroop run)
+ *   vas_recovery_change = post_recovery − pre_images   (images + rest)
+ *   vas_net_change      = post_recovery − pre_mist
  */
 (function () {
   "use strict";
   const MIN_RT = 0.2;
   const PHASES = ["baseline", "post_stress", "post_recovery"];
   const CHANGES = [["stress", "post_stress", "baseline"], ["recovery", "post_recovery", "post_stress"], ["net", "post_recovery", "baseline"]];
-  const VAS_TIMEPOINTS = ["baseline", "pre_mist", "post_mist", "post_recovery"];
+  const VAS_TIMEPOINTS = ["pre_mist", "post_mist", "pre_images", "post_recovery"];
+  const VAS_CHANGES = [
+    ["vas_stress_change", "post_mist", "pre_mist"],
+    ["vas_task_change", "pre_images", "post_mist"],
+    ["vas_recovery_change", "post_recovery", "pre_images"],
+    ["vas_net_change", "post_recovery", "pre_mist"],
+  ];
+  const TYPES = ["congruent", "incongruent"];
 
   const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
   const median = (a) => {
@@ -33,7 +44,7 @@
     return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
   };
   const r4 = (x) => (x == null || Number.isNaN(x) ? "" : Math.round(x * 10000) / 10000);
-  const diff = (a, b) => (a === "" || b === "" ? "" : r4(a - b));
+  const diff = (a, b) => (a === "" || b === "" || a == null || b == null ? "" : r4(a - b));
 
   const rtsOf = (rows) => rows.filter((r) => r.outcome === "correct" && r.rt !== "" && r.rt >= MIN_RT).map((r) => r.rt);
   const meanRt = (rows) => r4(mean(rtsOf(rows)));
@@ -42,9 +53,7 @@
     return responded.length ? r4(responded.filter((r) => r.outcome === "correct").length / responded.length) : "";
   };
 
-  let lateLimit = null;
-
-  function basic(rows) {
+  function basic(rows, lateLimit) {
     const rts = rtsOf(rows);
     return {
       n_trials: rows.length,
@@ -61,19 +70,15 @@
     };
   }
 
-  function stroopMeasures(rows) {
-    const by = (t) => rows.filter((r) => r.trial_type === t);
-    const types = ["congruent", "incongruent", "negative", "positive", "neutral"];
+  function stroopMeasures(rows, lateLimit) {
+    const by = (t) => rows.filter((r) => r.congruency === t);
     const rt = {}, ac = {};
-    for (const t of types) { rt[t] = meanRt(by(t)); ac[t] = acc(by(t)); }
-    const out = { ...basic(rows) };
-    for (const t of types) out["rt_" + t] = rt[t];
-    for (const t of types) out["acc_" + t] = ac[t];
+    for (const t of TYPES) { rt[t] = meanRt(by(t)); ac[t] = acc(by(t)); }
+    const out = { ...basic(rows, lateLimit) };
+    for (const t of TYPES) out["rt_" + t] = rt[t];
+    for (const t of TYPES) out["acc_" + t] = ac[t];
     out.stroop_interference_rt = diff(rt.incongruent, rt.congruent);
     out.stroop_interference_acc = diff(ac.congruent, ac.incongruent);
-    out.emotional_interference_neg_neu = diff(rt.negative, rt.neutral);
-    out.emotional_interference_pos_neu = diff(rt.positive, rt.neutral);
-    out.emotional_interference_neg_pos = diff(rt.negative, rt.positive);
     return out;
   }
 
@@ -83,25 +88,43 @@
     return { stressed: s, tense: t, calm: c, composite: s === "" || t === "" || c === "" ? "" : r4((s + t + (100 - c)) / 3) };
   }
 
-  function build({ cogRows, mistRows, vasRows, imageRows, frameMs }) {
-    const out = { participant_id: Core.Data.pid, task: "stroop" };
+  function build({ tables, sections, frameMs }) {
+    const T = tables || {};
+    const S = sections || {};
+    const P = S.participant || {};
+    const out = {
+      participant_id: Core.Data.pid,
+      prolific_pid: P.prolific_pid || "",
+      image_condition: P.image_condition || "",
+      quick_mode: P.quick_mode || 0,
+      debug_mode: P.debug_mode || 0,
+    };
     // Trials whose stimulus frame took > 1.5× the normal frame (onset delayed by a dropped frame).
-    lateLimit = frameMs ? 1.5 * frameMs : null;
+    const lateLimit = frameMs ? 1.5 * frameMs : null;
 
     // Stroop, per phase + changes
-    const measured = cogRows.filter((r) => r.is_practice === 0);
+    const measured = (T.stroop_trials || []).filter((r) => r.is_practice === 0);
     const byPhase = {};
-    for (const p of PHASES) byPhase[p] = stroopMeasures(measured.filter((r) => r.phase === p));
+    for (const p of PHASES) byPhase[p] = stroopMeasures(measured.filter((r) => r.phase === p), lateLimit);
     for (const p of PHASES) for (const [k, v] of Object.entries(byPhase[p])) out[`${p}_${k}`] = v;
     for (const [name, a, b] of CHANGES) {
       for (const k of Object.keys(byPhase[a])) {
         const x = byPhase[a][k], y = byPhase[b][k];
-        if (typeof x === "number" && typeof y === "number") out[`${name}_${k}`] = r4(x - y);
+        if (typeof x === "number" && typeof y === "number" && byPhase[a].n_trials && byPhase[b].n_trials) out[`${name}_${k}`] = r4(x - y);
+        else out[`${name}_${k}`] = "";
       }
     }
 
-    // MIST
-    const exp = mistRows.filter((r) => r.block === "experimental");
+    // MIST baseline (calibration) and stressor
+    const mist = T.mist_trials || [];
+    const base = mist.filter((r) => r.block === "baseline");
+    const cal = S.mist_calibration || {};
+    out.mist_baseline_n_trials = base.length;
+    out.mist_baseline_accuracy = base.length ? r4(base.filter((r) => r.accuracy === 1).length / base.length) : "";
+    out.mist_baseline_mean_rt_correct = r4(mean(base.filter((r) => r.accuracy === 1).map((r) => r.rt)));
+    out.mist_initial_time_limit = cal.initial_time_limit != null ? cal.initial_time_limit : "";
+    out.mist_time_limit_source = cal.source || "";
+    const exp = mist.filter((r) => r.block === "experimental");
     out.mist_n_trials = exp.length;
     out.mist_accuracy = exp.length ? r4(exp.filter((r) => r.accuracy === 1).length / exp.length) : "";
     out.mist_n_timeouts = exp.filter((r) => r.timed_out === 1).length;
@@ -109,20 +132,17 @@
     out.mist_final_time_limit = exp.length ? exp[exp.length - 1].next_time_limit : "";
 
     // VAS
+    const vas = T.vas || [];
     for (const tp of VAS_TIMEPOINTS) {
-      const v = vasMeasures(vasRows, tp);
+      const v = vasMeasures(vas, tp);
       for (const k of Object.keys(v)) out[`vas_${tp}_${k}`] = v[k];
     }
-    const comp = (tp) => out[`vas_${tp}_composite`];
-    out.vas_stress_change = diff(comp("post_mist"), comp("pre_mist"));          // stressor
-    out.vas_recovery_change = diff(comp("post_recovery"), comp("post_mist"));   // after images + rest
-    out.vas_net_change = diff(comp("post_recovery"), comp("baseline"));
-    const imgQ = vasRows.find((r) => r.measure === "image_feeling");
+    for (const [name, a, b] of VAS_CHANGES) out[name] = diff(out[`vas_${a}_composite`], out[`vas_${b}_composite`]);
+    const imgQ = vas.find((r) => r.measure === "image_feeling");
     out.vas_image_feeling = imgQ ? imgQ.rating : "";   // 0 = positive, 50 = neutral, 100 = negative
 
-    // Images
-    // Image rows with shown = 0 were skipped because the page was hidden.
-    const all = imageRows || [];
+    // Images (rows with shown = 0 were skipped because the page was hidden)
+    const all = T.image_trials || [];
     const imgs = all.filter((r) => r.shown !== 0);
     const durs = imgs.map((r) => r.duration_ms).filter((x) => typeof x === "number");
     out.images_n_planned = all.length;
@@ -137,8 +157,16 @@
     out.images_n_focus_lost = all.filter((r) => r.focus_lost === 1).length;
     const lastShown = imgs.filter((r) => typeof r.offset_time === "number").pop();
     out.images_total_s = imgs.length && lastShown ? r4(lastShown.offset_time - imgs[0].trial_onset_time) : "";
+
+    // Browser integrity (whole session)
+    const I = Core.Integrity.report();
+    out.fullscreen_exit_count = I.fullscreen_exit_count;
+    out.tab_hidden_count = I.tab_hidden_count;
+    out.window_blur_count = I.window_blur_count;
+    out.time_outside_fullscreen_s = I.time_outside_fullscreen_s;
+    out.time_hidden_s = I.time_hidden_s;
     return out;
   }
 
-  window.Summary = { build, stroopMeasures, MIN_RT, PHASES };
+  window.Summary = { build, stroopMeasures, MIN_RT, PHASES, VAS_TIMEPOINTS };
 })();

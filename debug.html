@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Debug launcher</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    .card { max-width: 980px; }
+    .presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 10px; }
+    .preset { border: 1px solid #d5dae3; border-radius: 8px; padding: 10px 12px; background: #fafbfd; }
+    .preset h4 { margin: 0 0 4px; font-size: .98rem; }
+    .preset p { margin: 0 0 6px; font-size: .85rem; color: var(--muted); }
+    .preset .btn { margin: 4px 0 0; padding: 7px 14px; font-size: .9rem; }
+    .steps { columns: 2; margin: 6px 0 10px; }
+    .steps label { display: block; padding: 2px 0; break-inside: avoid; }
+    .row { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; margin: 8px 0; }
+    .row label { display: flex; gap: 6px; align-items: center; }
+    select, input[type="text"] { font: inherit; padding: 6px 8px; border: 1px solid #b9c0cc; border-radius: 6px; }
+    code.url { display: block; word-break: break-all; background: #f4f5f8; padding: 8px; border-radius: 6px; font-size: .85rem; margin-top: 8px; }
+    .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-top: 10px; }
+    .thumbs figure { margin: 0; font-size: .7rem; color: var(--muted); word-break: break-all; }
+    .thumbs img { width: 100%; height: 80px; object-fit: cover; border-radius: 4px; background: #ddd; }
+    .bad { color: var(--bad-fg); font-weight: 600; }
+    .good { color: var(--ok-fg); font-weight: 600; }
+    table.cond { border-collapse: collapse; font-size: .9rem; }
+    table.cond td, table.cond th { border-bottom: 1px solid #e3e6ec; padding: 4px 10px; text-align: left; }
+  </style>
+</head>
+<body>
+<div id="page">
+<div class="card">
+  <h1>Debug launcher</h1>
+  <p class="muted">Test any part of the experiment without running the whole thing. Runs started here use
+  <b>debug mode</b>: no device check, nothing is uploaded unless you tick "Upload", a label in the corner shows the
+  current step, <b>F2 skips the rest of the current step</b>, and the end screen shows the data file
+  (with a Download button). The real study is <code>index.html</code>; settings are in <code>js/config.js</code>,
+  wording in <code>js/texts.js</code>.</p>
+
+  <h3>Options (used by every button below)</h3>
+  <div class="row">
+    <label><input type="checkbox" id="quick" checked> Quick mode (short blocks)</label>
+    <label>Image condition <select id="condition"></select></label>
+    <label>Stroop practice <select id="practice">
+      <option value="">automatic (first Stroop step)</option><option value="1">always</option><option value="0">never</option></select></label>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="upload"> Upload to</label>
+    <input type="text" id="upload_url" size="44" placeholder="http://localhost:8787/upload  (empty = DATA.UPLOAD_URL)">
+    <label>Participant code <input type="text" id="pid" size="14" placeholder="(random DEBUG_…)"></label>
+  </div>
+
+  <h3>Quick tests</h3>
+  <div class="presets" id="presets"></div>
+
+  <h3>Custom: pick steps</h3>
+  <p class="muted">The steps of <code>CONFIG.FLOW</code>, in order. Tick the ones to run.</p>
+  <div class="steps" id="steps"></div>
+  <div class="row">
+    <button class="btn" id="runCustom">Run ticked steps</button>
+    <button class="btn btn-secondary" id="all">Tick all</button>
+    <button class="btn btn-secondary" id="none">Untick all</button>
+  </div>
+  <code class="url" id="url"></code>
+
+  <h3>Image sets</h3>
+  <div id="condTable"></div>
+  <div class="row">
+    <label>Check set <select id="checkCond"></select></label>
+    <button class="btn btn-secondary" id="checkImgs">Load every image and report problems</button>
+    <span id="checkStatus"></span>
+  </div>
+  <div id="checkOut"></div>
+  <div class="thumbs" id="thumbs"></div>
+  <p class="muted">After adding or removing image files or folders, run <code>tools/build_image_manifest.bat</code>
+  (or <code>node tools/build_image_manifest.js</code>) and reload this page.</p>
+
+  <h3>Data files kept in this browser</h3>
+  <p class="muted">Every run keeps a copy of its data file in this browser (the newest 3 runs, for this
+  address only). Useful if an upload failed or you forgot to download.</p>
+  <div id="backups"></div>
+
+  <h3>As a participant sees it</h3>
+  <p class="muted">Not debug mode: the real flow and texts, with the debrief and Prolific screen at the end.
+  Without <code>DATA.UPLOAD_URL</code> it offers the file as a download at the end.</p>
+  <div class="row">
+    <a class="btn btn-secondary" id="realQuick" href="#">Real flow, quick</a>
+    <a class="btn btn-secondary" id="realFull" href="#">Real flow, full length</a>
+  </div>
+</div>
+</div>
+
+<script src="js/config.js"></script>
+<script src="js/image_manifest.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const FLOW = CONFIG.FLOW;
+const COND = CONFIG.IMAGES.CONDITIONS;
+const M = window.IMAGE_MANIFEST || {};
+
+// ── Options ────────────────────────────────────────────────────────────
+$("condition").innerHTML = `<option value="">random (as participants)</option>` +
+  Object.entries(COND).map(([k, c]) => `<option value="${k}">${c.label} (${k})</option>`).join("");
+$("checkCond").innerHTML = Object.entries(COND).map(([k, c]) => `<option value="${k}">${c.label}</option>`).join("");
+
+function buildUrl(extra) {
+  const p = new URLSearchParams();
+  p.set("debug", "1");
+  for (const [k, v] of Object.entries(extra || {})) if (v !== "" && v != null) p.set(k, v);
+  if ($("quick").checked) p.set("quick", "1");
+  if ($("condition").value) p.set("condition", $("condition").value);
+  if ($("practice").value) p.set("practice", $("practice").value);
+  if ($("upload").checked) {
+    p.set("upload", "1");
+    if ($("upload_url").value.trim()) p.set("upload_url", $("upload_url").value.trim());
+  }
+  if ($("pid").value.trim()) p.set("pid", $("pid").value.trim());
+  return "index.html?" + p.toString().replace(/%3A/g, ":").replace(/%2C/g, ",");
+}
+const go = (extra) => { location.href = buildUrl(extra); };
+
+// ── Presets ────────────────────────────────────────────────────────────
+const PRESETS = [
+  ["Whole study", "Every step of CONFIG.FLOW, in debug mode.", {}],
+  ["Forms only", "Consent, demographics (incl. medication question), setup, feedback.", { only: "consent,demographics,setup,feedback" }],
+  ["Start of the tasks", "The 'before you start' screen (average-performance rule).", { only: "intro" }],
+  ["Stroop, first run", "Instructions + practice (with feedback) + test.", { only: "stroop:baseline" }],
+  ["Stroop, later run", "Short reminder + test, no practice.", { only: "stroop:post_stress", practice: "0" }],
+  ["MIST baseline", "Self-paced practice block; shows the time limit it sets (end screen → mist_calibration).", { only: "mist_baseline" }],
+  ["MIST baseline + MIST", "Calibration, then the stressor starting from the calibrated limit.", { only: "mist_baseline,mist" }],
+  ["MIST stressor only", "Uses the default MIST.TIME_LIMIT (no baseline run).", { only: "mist" }],
+  ["VAS (all timepoints)", "Every 'how do you feel' rating of the flow (image question at post_recovery).", { only: "vas" }],
+  ["Images + blank", "The image block for the condition chosen above, then the rest screen.", { only: "images,blank" }],
+  ["From the stressor on", "VAS pre_mist to the end.", { from: "vas:pre_mist" }],
+  ["From the images on", "Images to the end.", { from: "images" }],
+];
+$("presets").innerHTML = "";
+for (const [title, text, extra] of PRESETS) {
+  const d = document.createElement("div");
+  d.className = "preset";
+  d.innerHTML = `<h4>${title}</h4><p>${text}</p>`;
+  const b = document.createElement("button");
+  b.className = "btn"; b.textContent = "Run";
+  b.onclick = () => go(extra);
+  d.appendChild(b);
+  $("presets").appendChild(d);
+}
+
+// ── Custom steps ───────────────────────────────────────────────────────
+$("steps").innerHTML = FLOW.map((s, i) => `<label><input type="checkbox" data-step="${s}" checked> ${i + 1}. ${s}</label>`).join("");
+const ticked = () => [...document.querySelectorAll("#steps input:checked")].map((x) => x.dataset.step);
+function showUrl() { $("url").textContent = buildUrl({ only: ticked().join(",") }); }
+document.addEventListener("change", showUrl);
+document.addEventListener("input", showUrl);
+$("runCustom").onclick = () => { if (ticked().length) go({ only: ticked().join(",") }); };
+$("all").onclick = () => { document.querySelectorAll("#steps input").forEach((x) => (x.checked = true)); showUrl(); };
+$("none").onclick = () => { document.querySelectorAll("#steps input").forEach((x) => (x.checked = false)); showUrl(); };
+showUrl();
+
+// ── Real flow links ────────────────────────────────────────────────────
+const realLink = (quick) => {
+  const p = new URLSearchParams({ pid: "test_" + Math.random().toString(36).slice(2, 7), skipcheck: "1" });
+  if (quick) p.set("quick", "1");
+  if ($("condition").value) p.set("condition", $("condition").value);
+  return "index.html?" + p.toString();
+};
+$("realQuick").onclick = (e) => { e.preventDefault(); location.href = realLink(true); };
+
+// ── Local backups (js/data.js keeps the newest 3 per browser) ───────────
+(function listBackups() {
+  const PREFIX = "stress_recovery_prolific_backup__";
+  let keys = [];
+  try { keys = Object.keys(localStorage).filter((k) => k.startsWith(PREFIX)); } catch (_) {}
+  if (!keys.length) { $("backups").innerHTML = '<p class="muted">(none)</p>'; return; }
+  const rows = keys.map((k) => { let j = {}; try { j = JSON.parse(localStorage.getItem(k)); } catch (_) {} return [k, j]; })
+    .sort((a, b) => ((a[1].saved_at || "") < (b[1].saved_at || "") ? 1 : -1));
+  const t = document.createElement("table");
+  t.className = "cond";
+  t.innerHTML = "<tr><th>file</th><th>status</th><th>last step</th><th>saved</th><th>uploaded</th><th></th></tr>";
+  for (const [k, j] of rows) {
+    const tr = document.createElement("tr");
+    const name = k.slice(PREFIX.length) + ".json";
+    tr.innerHTML = `<td>${name}</td><td>${j.status || ""}</td><td>${j.last_step || ""}</td><td>${(j.saved_at || "").replace("T", " ").slice(0, 19)}</td><td>${j.backup_uploaded ? "yes" : "no"}</td>`;
+    const td = document.createElement("td");
+    const b = document.createElement("button");
+    b.className = "btn btn-secondary"; b.textContent = "Download"; b.style.margin = "0";
+    b.onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([localStorage.getItem(k)], { type: "application/json" }));
+      a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    };
+    td.appendChild(b); tr.appendChild(td); t.appendChild(tr);
+  }
+  $("backups").appendChild(t);
+})();
+$("realFull").onclick = (e) => { e.preventDefault(); location.href = realLink(false); };
+
+// ── Image sets ─────────────────────────────────────────────────────────
+const assigned = CONFIG.IMAGES.ASSIGN_FROM || [];
+$("condTable").innerHTML = `<table class="cond"><tr><th>condition</th><th>folder</th><th>images</th><th>sizes</th><th>wide + HD</th><th>excluded</th><th>random assignment</th></tr>` +
+  Object.entries(COND).map(([k, c]) => {
+    const m = M[c.folder || k];
+    if (!m) return `<tr><td>${k}</td><td>images/${c.folder || k}/</td><td class="bad" colspan="5">not in js/image_manifest.js: run tools/build_image_manifest.bat</td></tr>`;
+    const nWide = m.images.filter((r) => r[4] && r[5]).length;
+    const few = m.n < CONFIG.IMAGES.N_IMAGES ? ` <span class="bad">(< ${CONFIG.IMAGES.N_IMAGES}: ${CONFIG.IMAGES.REPEAT_IF_FEWER ? "repeats" : "shorter block"})</span>` : "";
+    return `<tr><td>${k}</td><td>images/${c.folder || k}/</td><td>${m.n}${few}</td><td>${m.tiers.join(" + ") || "one"}</td><td>${nWide}</td><td>${m.excluded.length}</td><td>${assigned.includes(k) ? "yes" : "no"}</td></tr>`;
+  }).join("") + `</table>`;
+
+function loadImg(src) {
+  return new Promise((res) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+}
+$("checkImgs").onclick = async () => {
+  const k = $("checkCond").value, c = COND[k], folder = c.folder || k, m = M[folder];
+  $("thumbs").innerHTML = ""; $("checkOut").innerHTML = ""; $("checkStatus").textContent = "checking " + k + "…";
+  $("checkImgs").disabled = true;
+  if (!m) { $("checkStatus").innerHTML = `<span class="bad">${k}: no manifest entry</span>`; $("checkImgs").disabled = false; return; }
+  const dirs = m.tiers.length ? m.tiers.map((t) => `${folder}/${t}`) : [folder];
+  const jobs = [];
+  for (const d of dirs) for (const r of m.images) jobs.push({ dir: d, file: r[0] });
+  const bad = []; let done = 0;
+  const sample = new Set(m.images.map((r) => r[0]).sort(() => Math.random() - 0.5).slice(0, 36));
+  const queue = jobs.slice();
+  async function worker() {
+    while (queue.length) {
+      const j = queue.shift();
+      const src = `${CONFIG.IMAGES.ROOT}${j.dir}/${encodeURIComponent(j.file)}`;
+      const img = await loadImg(src);
+      done++;
+      if (!img) bad.push(`${j.dir}/${j.file}`);
+      else if (sample.has(j.file) && j.dir === dirs[0]) {
+        const f = document.createElement("figure");
+        img.alt = j.file; f.appendChild(img); f.appendChild(document.createTextNode(j.file));
+        $("thumbs").appendChild(f);
+      }
+      if (done % 20 === 0 || done === jobs.length) $("checkStatus").textContent = `${k}: ${done} / ${jobs.length} loaded…`;
+    }
+  }
+  await Promise.all(Array.from({ length: 8 }, worker));
+  $("checkImgs").disabled = false;
+  $("checkStatus").innerHTML = bad.length ? `<span class="bad">${k}: ${bad.length} of ${jobs.length} files failed to load</span>`
+    : `<span class="good">${k}: all ${jobs.length} files load ✓</span> (random sample below)`;
+  if (bad.length) $("checkOut").innerHTML = `<pre class="json-view">${bad.join("\n")}</pre>`;
+};
+</script>
+</body>
+</html>
