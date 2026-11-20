@@ -1,33 +1,28 @@
 /*
- * Emotional Stroop with colour words — 4 keys.
- * Based on stroop.py (stress-recovery-exp-with-stroop) with colour-word
- * trials added, so one run gives two effects:
+ * Stroop: traditional colour–word MATCH task with 2 keys.
  *
- *   Stroop interference    = RT incongruent − RT congruent   (RED in blue vs RED in red)
- *   Emotional interference = RT negative − RT neutral, RT positive − RT neutral
+ *   A colour word (RED / GREEN / BLUE / YELLOW) appears in a coloured ink.
+ *   Does the ink colour match the word?
+ *     match key    (default ← LEFT arrow)  = yes, they match   → congruent trials
+ *     mismatch key (default → RIGHT arrow) = no, they don't    → incongruent trials
+ *   Stroop interference = RT incongruent − RT congruent (and accuracy).
  *
- *   [Practice: "XXXXX" strings, first run only]  →  Test block (72 trials)
- *   Trial: blank ITI → fixation → word (until response / 2 s) →
- *          fixation (test) / white feedback (practice)
- *   Keys:  D = RED   F = GREEN   J = BLUE   K = YELLOW
+ *   First Stroop step of the session: instructions → practice with feedback
+ *   → test. Later steps: a short reminder → test.
+ *   Trial: blank ITI → fixation → word (until key / WORD_TIMEOUT) →
+ *          fixation (test) or "Correct / Incorrect / Too slow" (practice).
  *
- * Test-run composition (CONFIG.STROOP):
- *   congruent    12  each colour word 3× in its own ink
- *   incongruent  12  each colour word once in each of the 3 other inks
- *   negative     16  4 per ink   ┐ drawn from 20-word lists (stroop.py),
- *   positive     16  4 per ink   │ a fresh random 16 and word→ink pairing
- *   neutral      16  4 per ink   ┘ every run
- * Every ink appears 18 times. Order constraints: same ink ≤ 2 in a row,
- * same trial type ≤ 3 in a row, never the same word twice in a row.
- *
- * Emotional/neutral word lists, ink colours, timings and lab trigger codes
- * are identical to stroop.py; 74/75 are new codes for colour-word trials.
+ * Settings:  CONFIG.STROOP in js/config.js  (keys, trial counts, timings)
+ * Wording:   TEXTS.STROOP in js/texts.js
+ * Test alone: debug.html → "Stroop".
  */
 (function () {
   "use strict";
   const C = () => CONFIG.STROOP;
+  const T = () => TEXTS.STROOP;
   const { el, stage, present, sleep, sec } = Core;
 
+  // Ink colours (as in the lab stroop.py).
   const INK_RGB = {
     red: "rgb(165,0,0)",
     green: "rgb(0,230,0)",
@@ -35,99 +30,63 @@
     yellow: "rgb(255,255,0)",
   };
   const INKS = Object.keys(INK_RGB);
-  const KEY_FOR_INK = { red: "d", green: "f", blue: "j", yellow: "k" };
-  const RESP_KEYS = Object.values(KEY_FOR_INK);
-  const PRACTICE_STRING = "XXXXX";
+  const COLOUR_WORD = { red: "RED", green: "GREEN", blue: "BLUE", yellow: "YELLOW" };
 
   const TRIGGERS = {
     block_start: 13, practice_block_start: 14, fixation: 1,
-    word_practice: 70, word_neutral: 71, word_negative: 72, word_positive: 73,
     word_congruent: 74, word_incongruent: 75,
     response_correct: 41, response_incorrect: 42, response_timeout: 43, block_end: 9,
   };
 
-  const WORDS = {
-    negative: [
-      "panic", "failure", "worry", "afraid", "fear",
-      "scared", "threat", "crisis", "shame", "stress",
-      "trouble", "mistake", "tense", "chaos", "disaster",
-      "anxiety", "struggle", "terror", "ruin", "dumb",
-    ],
-    positive: [
-      "happy", "party", "cheer", "lucky", "surprise",
-      "proud", "amazing", "music", "joke", "weekend",
-      "genius", "freedom", "reward", "success", "victory",
-      "prize", "award", "awesome", "magic", "travel",
-    ],
-    neutral: [
-      "door", "table", "floor", "building", "glass",
-      "bottle", "shirt", "coat", "wall", "street",
-      "station", "bathroom", "corner", "bridge", "stairs",
-      "closet", "shoulder", "basket", "drawer", "ceiling",
-    ],
-  };
-  // Colour word for each ink (the word names the colour).
-  const COLOUR_WORD = { red: "red", green: "green", blue: "blue", yellow: "yellow" };
+  // Key mapping for this participant (set once by main.js via setMapping()).
+  let mapping = null;
+  function getMapping() {
+    if (!mapping) mapping = { match: C().KEYS.match, mismatch: C().KEYS.mismatch };
+    return mapping;
+  }
+  // COUNTERBALANCE_KEYS: swap the two keys for a random half of participants.
+  function chooseMapping() {
+    const k = C().KEYS;
+    mapping = C().COUNTERBALANCE_KEYS && Math.random() < 0.5
+      ? { match: k.mismatch, mismatch: k.match }
+      : { match: k.match, mismatch: k.mismatch };
+    return mapping;
+  }
+  function setMapping(m) { mapping = { match: m.match, mismatch: m.mismatch }; }
 
-  const REMINDER = "D = RED        F = GREEN        J = BLUE        K = YELLOW";
+  const keyLabel = (k) => (T().KEY_LABELS && T().KEY_LABELS[k]) || k.toUpperCase();
+  const fillKeys = (text) => Core.fill(text, {
+    MATCH_KEY: keyLabel(getMapping().match),
+    MISMATCH_KEY: keyLabel(getMapping().mismatch),
+  });
 
-  const INSTRUCT_GENERAL = `COLOUR NAMING TEST
+  // Bottom-of-screen reminder: each meaning on the side of its key.
+  function reminderText() {
+    const m = getMapping();
+    const left = m.match === "left" ? T().REMINDER_MATCH : m.mismatch === "left" ? T().REMINDER_MISMATCH : "";
+    const right = m.match === "right" ? T().REMINDER_MATCH : m.mismatch === "right" ? T().REMINDER_MISMATCH : "";
+    if (left && right) return `←  ${left}                    ${right}  →`;
+    return `${keyLabel(m.match)} = ${T().REMINDER_MATCH}        ${keyLabel(m.mismatch)} = ${T().REMINDER_MISMATCH}`;
+  }
 
-On each trial a word appears on screen, printed in one of four colours.
-
-Press the key for the COLOUR OF THE LETTERS.
-Ignore what the word says — even when the word is itself a colour name.
-
-  D  =  RED
-  F  =  GREEN
-  J  =  BLUE
-  K  =  YELLOW
-
-Keep two fingers of each hand on D F and J K.
-Respond as quickly and accurately as possible.
-
-Press SPACE to continue.`;
-
-  const INSTRUCT_PRACTICE = `PRACTICE
-
-First, a short practice with rows of X's.
-
-Press the key for the colour of the letters.
-
-  D = RED     F = GREEN     J = BLUE     K = YELLOW
-
-Press SPACE to begin practice.`;
-
-  const INSTRUCT_TEST = `COLOUR NAMING TEST
-
-Now real words will appear. Some of them are colour names.
-Ignore the word — respond only to the COLOUR OF THE LETTERS.
-
-For example, if you see  BLUE  printed in red letters, press D (red).
-
-  D = RED     F = GREEN     J = BLUE     K = YELLOW
-
-Press SPACE to begin.`;
-
-  const INSTRUCT_RETURN = `COLOUR NAMING TEST — again
-
-The same task as before.
-Press the key for the COLOUR OF THE LETTERS and ignore the word,
-even when the word is a colour name.
-
-  D  =  RED
-  F  =  GREEN
-  J  =  BLUE
-  K  =  YELLOW
-
-Keep two fingers of each hand on D F and J K.
-Respond as quickly and accurately as possible.
-
-Press SPACE to begin.`;
-
-  const INSTRUCT_END = `Task complete.  Thank you!
-
-Press SPACE to continue.`;
+  // Coloured examples under the first instructions: RED in red = match, RED in blue = no match.
+  function examplesElement() {
+    const wrap = el("div", "stroop-examples");
+    const ex = (inkKey, answer) => {
+      const box = el("div", "stroop-example", null, wrap);
+      const w = el("div", "stroop-example-word", "RED", box);
+      w.style.color = INK_RGB[inkKey];
+      el("div", "stroop-example-answer", answer, box);
+    };
+    const m = getMapping();
+    const items = [
+      ["red", `${T().REMINDER_MATCH}  (${keyLabel(m.match)})`, m.match],
+      ["blue", `${T().REMINDER_MISMATCH}  (${keyLabel(m.mismatch)})`, m.mismatch],
+    ];
+    if (items[0][2] === "right") items.reverse();   // each example on the side of its key
+    for (const [ink, text] of items) ex(ink, text);
+    return wrap;
+  }
 
   // ── Sequences (constrained shuffle, as stroop._constrained_order) ──────
   function runOk(seq, item, attr, maxRun) {
@@ -135,15 +94,17 @@ Press SPACE to continue.`;
     return seq.slice(-maxRun).some((t) => t[attr] !== item[attr]);
   }
 
-  function constrainedOrder(trials, maxInkRun, maxTypeRun, maxAttempts = 2000) {
+  // Random order with: same ink ≤ MAX_INK_RUN in a row, same answer
+  // (congruency) ≤ MAX_TYPE_RUN in a row, never the same word twice in a row.
+  function constrainedOrder(trials, maxInkRun, maxTypeRun, maxAttempts = 5000) {
     for (let a = 0; a < maxAttempts; a++) {
       const pool = Core.shuffle(trials.slice());
       const seq = [];
       while (pool.length) {
         const cands = pool.filter((t) =>
           runOk(seq, t, "ink", maxInkRun) &&
-          runOk(seq, t, "trial_type", maxTypeRun) &&
-          (t.word === PRACTICE_STRING || runOk(seq, t, "word", 1)));
+          runOk(seq, t, "congruency", maxTypeRun) &&
+          runOk(seq, t, "word", 1));
         if (!cands.length) break;
         const pick = Core.choice(cands);
         pool.splice(pool.indexOf(pick), 1);
@@ -151,56 +112,49 @@ Press SPACE to continue.`;
       }
       if (!pool.length) return seq;
     }
-    throw new Error("Could not build a Stroop sequence satisfying the ordering constraints");
+    // Constraints impossible for these counts (e.g. odd quick-mode numbers):
+    // fall back to the word rule only, then to a plain shuffle.
+    console.warn("Stroop: ordering constraints could not be met; relaxing them");
+    Core.Events.log("Stroop_Markers", 0, "order_constraints_relaxed", String(trials.length));
+    return maxInkRun != null || maxTypeRun != null ? constrainedOrder(trials, null, null, 2000) : Core.shuffle(trials.slice());
   }
 
-  // trial_type: congruent | incongruent | negative | positive | neutral | practice
-  // word_category: colour | negative | positive | neutral | practice
-  // congruency: congruent | incongruent | "" (word is not a colour name)
-  function makeTrial(word, wordCategory, trialType, ink) {
+  function makeTrial(wordInk, ink) {
+    const congruent = wordInk === ink;
+    const answer = congruent ? "match" : "mismatch";
     return {
-      word: word.toUpperCase(),
-      word_category: wordCategory,
-      trial_type: trialType,
-      congruency: trialType === "congruent" || trialType === "incongruent" ? trialType : "",
+      word: COLOUR_WORD[wordInk],
+      word_colour: wordInk,
       ink,
-      correct_resp: KEY_FOR_INK[ink],
+      congruency: congruent ? "congruent" : "incongruent",
+      correct_answer: answer,
+      correct_resp: getMapping()[answer],
     };
   }
 
-  // n copies of each ink, in order (red, green, blue, yellow, red, …).
-  function inkCycle(n) {
-    const out = [];
-    while (out.length < n) out.push(...INKS);
-    return out.slice(0, n);
-  }
-
-  function makeTestSequence() {
-    const P = C();
-    let trials = [];
-
-    // Congruent: each colour word in its own ink, N_CONGRUENT / 4 times.
-    for (let r = 0; r < Math.floor(P.N_CONGRUENT / INKS.length); r++)
-      for (const ink of INKS) trials.push(makeTrial(COLOUR_WORD[ink], "colour", "congruent", ink));
-
-    // Incongruent: each colour word in each other ink, N_INCONGRUENT / 12 times.
-    const pairs = [];
-    for (const wordInk of INKS) for (const ink of INKS) if (ink !== wordInk) pairs.push([wordInk, ink]);
-    for (let r = 0; r < Math.floor(P.N_INCONGRUENT / pairs.length); r++)
-      for (const [wordInk, ink] of pairs) trials.push(makeTrial(COLOUR_WORD[wordInk], "colour", "incongruent", ink));
-
-    // Emotional / neutral words: a random subset per run, equal inks per category.
-    const n = Math.min(P.WORDS_PER_EMOTION, 20);
-    for (const [cat, words] of Object.entries(WORDS)) {
-      const chosen = Core.shuffle(words.slice()).slice(0, n);
-      const inks = Core.shuffle(inkCycle(n));
-      chosen.forEach((w, i) => trials.push(makeTrial(w, cat, cat, inks[i])));
+  // Test run: N_CONGRUENT congruent (each word equally often in its own ink)
+  // + N_INCONGRUENT incongruent (each word equally often in each other ink).
+  function makeTestSequence(nCong = C().N_CONGRUENT, nIncong = C().N_INCONGRUENT) {
+    const trials = [];
+    for (let i = 0; i < nCong; i++) {
+      const ink = INKS[i % INKS.length];
+      trials.push(makeTrial(ink, ink));
     }
-    return constrainedOrder(trials, P.MAX_INK_RUN, P.MAX_TYPE_RUN);
+    const pairs = [];
+    for (const w of INKS) for (const ink of INKS) if (ink !== w) pairs.push([w, ink]);
+    const pairOrder = Core.shuffle(pairs.slice());   // a non-multiple of 12 still spreads evenly
+    for (let i = 0; i < nIncong; i++) {
+      const [w, ink] = pairOrder[i % pairOrder.length];
+      trials.push(makeTrial(w, ink));
+    }
+    return constrainedOrder(trials, C().MAX_INK_RUN, C().MAX_TYPE_RUN);
   }
 
-  function makePracticeSequence(n) {
-    return constrainedOrder(inkCycle(n).map((ink) => makeTrial(PRACTICE_STRING, "practice", "practice", ink)), C().MAX_INK_RUN, null);
+  // Practice: half congruent, half incongruent, built like the test run
+  // (inks cycled, word–ink pairs spread evenly), so the order rules can be met.
+  function makePracticeSequence(n = C().N_PRACTICE_TRIALS) {
+    const nCong = Math.floor(n / 2);
+    return makeTestSequence(nCong, n - nCong);
   }
 
   // ── Display ────────────────────────────────────────────────────────────
@@ -211,7 +165,7 @@ Press SPACE to continue.`;
       fixation: el("div", "stim fixation", "+", s),
       word: el("div", "stim stroop-word", "", s),
       feedback: el("div", "stim feedback-text", "", s),
-      reminder: el("div", "stim reminder", REMINDER, s),
+      reminder: el("div", "stim reminder", reminderText(), s),
     };
   }
   function show(st, which) {
@@ -235,10 +189,11 @@ Press SPACE to continue.`;
       st.word.style.color = INK_RGB[trial.ink];
       show(st, ["word", "reminder"]);
     });
-    ev(TRIGGERS["word_" + trial.trial_type], "word_" + trial.trial_type);
+    ev(TRIGGERS["word_" + trial.congruency], "word_" + trial.congruency);
     const frameMs = Core.lastFrameMs;
 
-    const r = await Core.waitForKey(RESP_KEYS, { timeout: C().WORD_TIMEOUT, onset });
+    const m = getMapping();
+    const r = await Core.waitForKey([m.match, m.mismatch], { timeout: C().WORD_TIMEOUT, onset });
     if (r.timedOut) ev(TRIGGERS.response_timeout, "response_timeout");
     else if (r.key === trial.correct_resp) ev(TRIGGERS.response_correct, "response_correct");
     else ev(TRIGGERS.response_incorrect, "response_incorrect");
@@ -250,14 +205,22 @@ Press SPACE to continue.`;
     Core.Events.log("Stroop_Markers", isPractice ? TRIGGERS.practice_block_start : TRIGGERS.block_start,
       isPractice ? "practice_block_start" : "block_start");
     const rows = [];
+    const m = getMapping();
     for (let i = 0; i < trials.length; i++) {
+      if (Core.Skip.requested) break;                         // debug: F2
+      if (!Core.isFullscreen()) {                              // left full screen: pause between trials
+        await Core.betweenTrials();
+        Core.showStage();
+      }
       const t = trials[i];
       const r = await runTrial(st, t);
+      if (r.skipped) break;
       const outcome = r.timedOut ? "missed" : r.key === t.correct_resp ? "correct" : "incorrect";
 
       if (isPractice) {
         await present(() => {
-          st.feedback.textContent = r.timedOut ? "Too Slow" : outcome === "correct" ? "Correct" : "Incorrect";
+          const F = T().FEEDBACK;
+          st.feedback.textContent = r.timedOut ? F.too_slow : outcome === "correct" ? F.correct : F.incorrect;
           show(st, ["feedback"]);
         });
       } else {
@@ -268,56 +231,70 @@ Press SPACE to continue.`;
       const row = {
         participant_id: Core.Data.pid,
         session: Core.Data.session,
+        step: Core.step,
         phase,
         block_type: blockType,
+        is_practice: Number(isPractice),
         trial: i + 1,
         word: t.word,
-        word_category: t.word_category,
-        trial_type: t.trial_type,
-        congruency: t.congruency,
+        word_colour: t.word_colour,
         ink_color: t.ink,
+        congruency: t.congruency,
+        trial_type: t.congruency,
+        correct_answer: t.correct_answer,
         correct_response: t.correct_resp,
         participant_response: r.key || "",
+        response_answer: r.key === m.match ? "match" : r.key === m.mismatch ? "mismatch" : "",
         outcome,
         accuracy: r.timedOut ? "" : Number(outcome === "correct"),
         rt: r.timedOut ? "" : Math.round(r.rt * 10000) / 10000,
         timed_out: Number(r.timedOut),
         trial_onset_time: sec(r.onset),
-        is_practice: Number(isPractice),
         onset_frame_ms: r.frameMs,
         focus_lost: Number(Core.Quality.trialFlags.focusLost),
         fullscreen: Number(Core.isFullscreen()),
       };
       rows.push(row);
-      Core.Data.stream("stroop_trials", row);   // uploaded as it happens
+      Core.Data.stream("stroop_trials", row);
     }
     Core.Events.log("Stroop_Markers", TRIGGERS.block_end, "block_end");
     return rows;
   }
 
+  let runsDone = 0;   // the first run of the session gets instructions + practice
+
   /*
-   * Run one Stroop run. `firstRun` adds the general instructions + practice.
+   * Run one Stroop step. The first Stroop step of the session shows the full
+   * instructions and (by default) the practice; later steps a short reminder.
+   * practice: true / false forces / suppresses the practice (debug).
    * Returns all rows (practice + test).
    */
-  async function run({ phase, firstRun }) {
+  async function run({ phase, practice } = {}) {
     Core.phase = phase;
+    const first = runsDone === 0;
+    const withPractice = (practice != null ? practice : first) && C().N_PRACTICE_TRIALS > 0;
+    runsDone++;
     let rows = [];
-    if (firstRun) {
-      await Core.instructions(INSTRUCT_GENERAL);
-      if (C().N_PRACTICE_TRIALS > 0) {
-        await Core.instructions(INSTRUCT_PRACTICE);
-        Core.showStage();
-        rows = rows.concat(await runBlock(buildStims(), makePracticeSequence(C().N_PRACTICE_TRIALS), "practice", phase));
-      }
-      await Core.instructions(INSTRUCT_TEST);
+    if (first) await Core.instructions(fillKeys(T().GENERAL), { extra: examplesElement(), minMs: 3000 });
+    if (withPractice) {
+      await Core.instructions(fillKeys(T().PRACTICE));
+      Core.showStage();
+      rows = rows.concat(await runBlock(buildStims(), makePracticeSequence(), "practice", phase));
+      await Core.instructions(fillKeys(T().TEST_START));
+    } else if (first) {
+      await Core.instructions(fillKeys(T().TEST_START_NO_PRACTICE));
     } else {
-      await Core.instructions(INSTRUCT_RETURN);
+      await Core.instructions(fillKeys(T().RETURN));
     }
     Core.showStage();
     rows = rows.concat(await runBlock(buildStims(), makeTestSequence(), "test", phase));
-    await Core.instructions(INSTRUCT_END);
+    await Core.instructions(T().END);
     return rows;
   }
 
-  window.Stroop = { run, makeTestSequence, makePracticeSequence, WORDS, INKS, KEY_FOR_INK, TRIGGERS, COLOUR_WORD };
+  window.Stroop = {
+    run, chooseMapping, setMapping, getMapping,
+    makeTestSequence, makePracticeSequence, constrainedOrder,
+    INKS, INK_RGB, COLOUR_WORD, TRIGGERS,
+  };
 })();

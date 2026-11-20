@@ -1,264 +1,275 @@
 /*
- * Session flow (one session per participant, ~30 min):
+ * Session flow: runs the steps listed in CONFIG.FLOW (js/config.js), in
+ * order. Default:
  *
- *   Device check → Info + consent → Demographics → Setup (sound, full screen)
- *   → VAS (baseline)
- *   → Stroop (baseline)            first run: instructions + practice
- *   → VAS (pre_mist)
- *   → MIST stressor (+ white noise)
- *   → VAS (post_mist)
- *   → Stroop (post_stress)
- *   → Image intervention           120 Positive Prime images × 2.5 s = 5 min
- *   → Rest: fixation cross, 1 min
- *   → VAS (post_recovery) + "How did the images make you feel?"
- *   → Stroop (post_recovery)
- *   → Feedback → Upload → Debrief → back to Prolific
+ *   consent → demographics → setup (sound check, full screen) → intro
+ *   → stroop:baseline         (first Stroop run: instructions + practice)
+ *   → vas:pre_mist
+ *   → mist_baseline           (practice, nothing at stake → sets the MIST time limit)
+ *   → mist                    (stressor)
+ *   → vas:post_mist
+ *   → stroop:post_stress
+ *   → vas:pre_images
+ *   → images                  (the participant's image condition, 5 min)
+ *   → blank                   (1 min rest)
+ *   → vas:post_recovery       (+ "How did the images make you feel?")
+ *   → stroop:post_recovery
+ *   → feedback → upload → debrief → back to Prolific
  *
- * Phase / timepoint labels follow the lab (stress-recovery-exp-with-stroop):
- * VAS pre_mist / post_mist / post_recovery, plus an online-only `baseline`
- * VAS before the first Stroop run.
+ * To change the order: edit CONFIG.FLOW. To test parts: debug.html.
+ * To add a new kind of step: add a function to RUNNERS below.
  *
- * Data are kept wherever a participant stops:
- *   - trial rows are uploaded while each task runs (Core.Data.stream);
- *   - after every section a fresh `summary` row is saved with
- *     status = "in_progress" and last_step = the section just finished;
- *   - if the page is closed early, a final summary row with status = "quit"
- *     and everything not yet uploaded are sent (Core.Data.quitFlush);
- *   - the last summary row of a finished session has status = "complete".
- *   The newest summary row per participant_id is the one to use.
- *
- * A participant who opens the study again (same PROLIFIC_PID, same browser)
- * after consenting once gets "(2)", "(3)", … appended to their code.
+ * Data (js/data.js): after every step a snapshot of the whole data file is
+ * backed up locally and uploaded to progress/; the complete file goes to
+ * complete/ at the end; if the page is closed early a small file goes to quit/.
  */
 (function () {
   "use strict";
   const D = Core.Data;
-  const VERSION = "1.1.0";
+  const { iso, el } = Core;
+  const params = new URLSearchParams(location.search);
+  const DEBUG = Debug.active;
 
   const REST_TRIGGERS = { rest_start: 80, rest_end: 81 };
+  const FORM_STEPS = ["consent", "demographics", "setup", "feedback"];
 
-  let sessionInfo = null;
+  let who = null;
   let startedAt = null;
-  let lastStep = "";
+  let started = false;
+  let device = null;
   let frameMs = null;
-  let prolific = {};
+  let stroopRuns = 0;
+  const stepsRun = [];
 
-  function saveEvents() { D.save("events", Core.Events.take()); }
-
-  function warnOnLeave(e) { e.preventDefault(); e.returnValue = ""; }
-
-  const minutesSince = (isoStart) =>
-    isoStart ? Math.round((Date.now() - Date.parse(isoStart)) / 600) / 100 : "";
-
-  // Summary of everything done so far (built from all rows, saved or buffered).
-  function summaryRow(status) {
-    const s = Summary.build({
-      cogRows: D.all("stroop_trials"),
-      mistRows: D.all("mist_trials"),
-      vasRows: D.all("vas"),
-      imageRows: D.all("image_trials"),
-      frameMs,
-    });
-    return {
-      ...s, ...prolific,
-      attempt: D.attempt,
-      status,                        // in_progress | quit | complete
-      complete: Number(status === "complete"),
-      last_step: lastStep,
-      minutes_since_start: minutesSince(startedAt),
-      saved_at: Core.iso(),
-      app_version: VERSION,
-      quick_mode: Number(!!CONFIG.QUICK_MODE),
-    };
+  // The settings this session ran with (saved in the data file, without the upload URL),
+  // and a fingerprint of all participant texts: a change during data collection is visible.
+  function configForFile() {
+    const c = JSON.parse(JSON.stringify(CONFIG));
+    if (c.DATA) c.DATA.UPLOAD_URL = c.DATA.UPLOAD_URL ? "(set)" : "";
+    return c;
+  }
+  function textsHash() {
+    const str = JSON.stringify(window.TEXTS || {});
+    let h = 0x811c9dc5;                       // FNV-1a, 32 bit
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, "0");
   }
 
-  // End of a section: upload its remaining rows, the event log, and a fresh summary.
-  function sectionDone(step) {
-    lastStep = step;
-    D.flushStreams();
-    saveEvents();
-    D.save("summary", [summaryRow("in_progress")]);
+  // "Leave site?" warning until the complete file is saved (or there is no upload).
+  function warnOnLeave(e) {
+    if (D.completeUploaded || (D.finished && !D.uploadEnabled)) return;
+    e.preventDefault(); e.returnValue = "";
   }
 
-  // Called by Core.Data.quitFlush() if the page closes before the end.
-  function onQuit() {
-    const out = [["summary", [summaryRow("quit")]]];
-    out.push(["sessions", [{
-      ...(sessionInfo || { participant_id: D.pid, ...prolific, attempt: D.attempt, app_version: VERSION }),
-      status: "quit", last_step: lastStep, quit_time: Core.iso(), duration_min: minutesSince(startedAt),
-      window_blur_count: Core.Quality.blurCount, tab_hidden_count: Core.Quality.hiddenCount,
-      fullscreen_exit_count: Core.Quality.fullscreenExits,
-    }]]);
-    return out;
+  // Things that need the first click (audio) or should start early (images).
+  // Called once: after consent, or by the debug start screen.
+  function onStarted() {
+    if (started) return;
+    started = true;
+    if (!DEBUG && who) who.commit();         // a later reopen of the link becomes attempt 2
+    startedAt = iso();
+    D.started = true;
+    D.merge("session", { start_time: startedAt });
+    try { Core.audio = Core.audio || new (window.AudioContext || window.webkitAudioContext)(); } catch (_) { Core.audio = null; }
+    Images.preload();                        // download the images in the background
+    if (!DEBUG) window.addEventListener("beforeunload", warnOnLeave);
   }
 
-  async function cog(phase, firstRun) {
-    await Stroop.run({ phase, firstRun });   // rows are streamed as they happen
-    sectionDone("stroop_" + phase);
+  // Display / timing / audio, measured in full screen before the first task.
+  async function measureDevice(nFrames = 120) {
+    Core.showStage();
+    Core.clearStage();
+    device = await Core.deviceInfo(nFrames);
+    frameMs = device.frame_ms_median || 1000 / 60;
+    D.frameMs = frameMs;
+    D.merge("session", { device, image_tier: Images.chooseTier() });
   }
 
-  async function vas(timepoint, opts) {
-    await VAS.run(timepoint, opts);          // rows are streamed as they happen
-    sectionDone("vas_" + timepoint);
-  }
-
-  // Fixation cross for `ms` (after the images, before the post-recovery VAS).
+  // Fixation cross / blank screen for `ms` (rest after the images).
   async function rest(ms) {
     Core.phase = "rest";
     Core.showStage();
     await Core.ensureFullscreen();
     Core.clearStage();
-    const fix = Core.el("div", "stim fixation", "+", Core.stage());
-    const onset = await Core.present(() => { fix.style.visibility = "visible"; });
-    Core.Events.log("Rest_Markers", REST_TRIGGERS.rest_start, "rest_start");
-    await Core.sleep(Math.max(0, onset + ms - Core.now()));
+    const fix = CONFIG.REST.SHOW_FIXATION ? el("div", "stim fixation", "+", Core.stage()) : null;
+    const onset = await Core.present(() => { if (fix) fix.style.visibility = "visible"; });
+    Core.Events.log("Rest_Markers", REST_TRIGGERS.rest_start, "rest_start", fix ? "fixation" : "blank");
+    await Core.wait(Math.max(0, onset + ms - Core.now()));
     Core.Events.log("Rest_Markers", REST_TRIGGERS.rest_end, "rest_end");
     Core.clearStage();
   }
 
+  // ── Steps ──────────────────────────────────────────────────────────────
+  // Each runner gets the part after ":" of the step id (e.g. "post_stress").
+  const practiceParam = params.get("practice");
+  const RUNNERS = {
+    consent: async () => {
+      const c = await Forms.consent();
+      D.set("consent", c);
+      onStarted();
+    },
+    demographics: async () => {
+      const d = await Forms.demographics();
+      D.set("demographics", { ...d, submitted: iso() });
+    },
+    setup: async () => {
+      const s = await Forms.setup();
+      D.merge("session", s);
+      Core.Events.log("Session", 0, "tasks_start", JSON.stringify(s));
+      await measureDevice();
+    },
+    intro: async () => {
+      Core.phase = "intro";
+      await Core.instructions(TEXTS.TASK_INTRO, { minMs: 4000 });
+    },
+    stroop: (phase) => Stroop.run({
+      phase: phase || "baseline",
+      // debug practice=1 / 0: force / suppress the practice of the FIRST Stroop step
+      practice: DEBUG && practiceParam != null && stroopRuns++ === 0 ? practiceParam === "1" : undefined,
+    }),
+    vas: (timepoint) => VAS.run(timepoint || "vas"),
+    mist_baseline: () => MIST.runBaseline(),
+    mist: () => MIST.run(),
+    images: () => Images.run({ phase: "intervention", frameMs: frameMs || 1000 / 60 }),
+    blank: () => rest(CONFIG.REST.DURATION),
+    feedback: async () => {
+      // Frame timing again before leaving full screen (did the machine slow down?).
+      if (Core.isFullscreen()) D.merge("session", { end_frames: await Core.measureFrames(60) });
+      await Core.exitFullscreen();
+      Core.phase = "feedback";
+      const fb = await Forms.feedback();
+      D.set("feedback", { ...fb, submitted: iso() });
+    },
+  };
+
+  function runnerFor(id) {
+    const [name, arg] = String(id).split(":");
+    const r = RUNNERS[name];
+    if (!r) throw new Error(`Unknown step "${id}" in CONFIG.FLOW (known: ${Object.keys(RUNNERS).join(", ")})`);
+    return () => r(arg);
+  }
+
+  async function runStep(id) {
+    const run = runnerFor(id);
+    const name = id.split(":")[0];
+    Core.step = id;
+    Core.Skip.reset();
+    Debug.setStep(id);
+    // A task step needs the device measured first (normally done by "setup").
+    if (!device && !FORM_STEPS.includes(name)) await measureDevice(60);
+    const t0 = Core.now();
+    const rec = { step: id, start: iso(), end: "", duration_s: "" };
+    stepsRun.push(rec);
+    D.merge("session", { steps_run: stepsRun });
+    Core.Events.log("Session", 0, "step_start", id);
+    if (DEBUG && FORM_STEPS.includes(name)) await Promise.race([run(), Core.Skip.promise()]);   // F2 skips forms too
+    else await run();
+    rec.end = iso();
+    rec.duration_s = Math.round((Core.now() - t0) / 100) / 10;
+    Core.Events.log("Session", 0, "step_end", id);
+    D.checkpoint(id);
+  }
+
   // A real Prolific participant must not reach the end of a study that can't
   // save data or pay them: check the setup before they start.
-  function setupProblem(params) {
-    if (!prolific.prolific_pid || params.get("pilot") === "1") return null;
+  function setupProblem(prolific) {
+    if (DEBUG || !prolific.prolific_pid || params.get("pilot") === "1") return null;
     const code = (CONFIG.PROLIFIC && CONFIG.PROLIFIC.COMPLETION_CODE) || "";
-    if (!CONFIG.DATA_URL || !code || /EDIT/i.test(code))
-      return "Sorry, this study is not ready yet (it has not been fully set up). Please return it on Prolific — you have not lost anything.";
+    if (!CONFIG.DATA.UPLOAD_URL || !code || /EDIT/i.test(code) || /EDIT ME|you@university/i.test(CONFIG.RESEARCHER_CONTACT || ""))
+      return "Sorry, this study is not ready yet (it has not been fully set up). Please return it on Prolific. You have not lost anything.";
     return null;
   }
 
   async function main() {
-    const params = new URLSearchParams(location.search);
-    prolific = Core.prolificInfo();
-    const who = Core.identity();
+    Debug.init();
+    const prolific = Core.prolificInfo();
+    who = Core.identity(DEBUG ? "DEBUG_" : "P");
     D.pid = who.pid;
     D.attempt = who.attempt;
 
-    const problem = (params.get("skipcheck") === "1" ? null : Forms.deviceProblem()) || setupProblem(params);
+    // Upload: on when an address is set; in debug mode only with &upload=1.
+    const urlOverride = DEBUG ? params.get("upload_url") : null;
+    D.uploadUrl = urlOverride || CONFIG.DATA.UPLOAD_URL || "";
+    D.uploadEnabled = !!D.uploadUrl && (!DEBUG || params.get("upload") === "1" || !!urlOverride);
+
+    const skipCheck = DEBUG || (params.get("skipcheck") === "1" && !prolific.prolific_pid);
+    const problem = (skipCheck ? null : Forms.deviceProblem()) || setupProblem(prolific);
     if (problem) { Forms.blocked(problem); return; }
 
-    // ── Consent ──────────────────────────────────────────────────────────
-    const consent = await Forms.consent();
-    who.commit();                       // a later reopen of the link becomes attempt 2
-    startedAt = Core.iso();
-    D.onQuit = onQuit;
-    // Audio must be created on a user gesture (the consent click).
-    try { Core.audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) { Core.audio = null; }
-    // Start downloading the intervention images in the background.
-    Images.preload();
-    window.addEventListener("beforeunload", warnOnLeave);
-    lastStep = "consent";
+    // Image condition and Stroop keys for this participant.
+    const requested = (params.get("condition") || "").trim().toLowerCase();
+    if (requested && !Images.availableConditions().includes(requested)) {
+      const msg = `Unknown image condition "${requested}" in the study link (known: ${Images.availableConditions().join(", ")}).`;
+      if (DEBUG) throw new Error(msg);
+      console.error(msg);
+      Forms.blocked("Sorry, this study link is not set up correctly. Please return the study on Prolific and message the researcher. You have not lost anything.");
+      return;
+    }
+    const cond = Images.assignCondition({ requested, baseId: who.base, forget: DEBUG });
+    const mapping = Stroop.chooseMapping();
 
-    // ── Demographics ─────────────────────────────────────────────────────
-    const demo = await Forms.demographics();
-    D.save("demographics", [{ participant_id: D.pid, ...prolific, attempt: D.attempt, ...consent, ...demo, submitted: Core.iso() }]);
-    lastStep = "demographics";
+    const steps = Debug.selectSteps(CONFIG.FLOW);
+    steps.forEach(runnerFor);   // stop now if a step name is wrong
+    const dup = steps.find((s, i) => steps.indexOf(s) !== i);
+    if (dup) throw new Error(`Step "${dup}" appears twice. Each step id must be unique: use a new name, e.g. "stroop:follow_up" (see CONFIG.FLOW).`);
 
-    // ── Setup ────────────────────────────────────────────────────────────
-    const setup = await Forms.setup();
-    Core.Events.log("Session", 0, "tasks_start", JSON.stringify(setup));
+    D.set("participant", {
+      participant_id: D.pid, attempt: D.attempt, page_load_id: D.loadId, ...prolific,
+      image_condition: cond.condition, image_condition_source: cond.source, image_condition_requested: requested,
+      stroop_key_mapping: mapping,
+      quick_mode: Number(!!CONFIG.QUICK_MODE), debug_mode: Number(DEBUG),
+      test_run: Number(!prolific.prolific_pid),   // no Prolific ID: a pilot / launcher / bare-URL run (analysis drops these)
+    });
+    D.set("session", {
+      start_time: "", app_version: CONFIG.APP_VERSION, url_params: location.search,
+      flow: CONFIG.FLOW.slice(), steps_planned: steps, steps_run: stepsRun,
+      config: configForFile(), texts_hash: textsHash(),
+    });
+    if (!Core.fsSupported()) Core.Integrity.unsupported = 1;
 
-    // Display / timing / audio, measured in full screen just before the tasks.
-    Core.showStage();
-    Core.clearStage();
-    const device = await Core.deviceInfo();
-    frameMs = device.frame_ms_median || 1000 / 60;
-    sessionInfo = {
-      participant_id: D.pid, status: "started", task: "stroop", ...prolific, attempt: D.attempt,
-      start_time: startedAt, app_version: VERSION, quick_mode: Number(!!CONFIG.QUICK_MODE),
-      url_params: location.search, image_tier: Images.chooseTier(), ...setup, ...device,
-    };
-    D.save("sessions", [sessionInfo]);
-    lastStep = "setup";
+    if (DEBUG) {
+      await Debug.startScreen({ steps, pid: D.pid, condition: cond.condition, conditionSource: cond.source, mapping, upload: D.uploadEnabled ? D.uploadUrl : "" });
+      onStarted();
+    } else if (steps[0] !== "consent") {
+      throw new Error('CONFIG.FLOW must start with "consent"');
+    }
 
-    // ── 1. VAS, baseline ─────────────────────────────────────────────────
-    Core.phase = "vas_baseline";
-    await Core.instructions(`HOW DO YOU FEEL?
+    for (const id of steps) await runStep(id);
 
-A few times during the study you will be asked how you feel right now.
-
-Click anywhere on the line to give your answer
-(you can click again or drag to change it), then click Confirm.
-
-Press SPACE to continue.`);
-    await vas("baseline");
-
-    // ── 2. Stroop, baseline (with instructions + practice) ───────────────
-    await cog("baseline", true);
-
-    // ── 3. VAS before the stressor ───────────────────────────────────────
-    await vas("pre_mist");
-
-    // ── 4. Stressor ──────────────────────────────────────────────────────
-    await MIST.run();                         // rows are streamed as they happen
-    sectionDone("mist");
-
-    // ── 5. VAS after the stressor ────────────────────────────────────────
-    await vas("post_mist");
-
-    // ── 6. Stroop, post-stress ───────────────────────────────────────────
-    await cog("post_stress", false);
-
-    // ── 7. Image intervention ────────────────────────────────────────────
-    await Images.run({ phase: "intervention", frameMs });
-    sectionDone("images");
-
-    // ── 8. Rest: fixation cross ──────────────────────────────────────────
-    await rest(CONFIG.REST_DURATION);
-    sectionDone("rest");
-
-    // ── 9. VAS after recovery, plus the image question ───────────────────
-    await vas("post_recovery", { imageQuestion: true });
-
-    // ── 10. Stroop, post-recovery ────────────────────────────────────────
-    await cog("post_recovery", false);
-
-    // Frame timing again at the end (did the machine slow down?).
-    const endFrames = await Core.measureFrames(60);
-
-    // ── Feedback ─────────────────────────────────────────────────────────
-    if (Core.isFullscreen()) { try { await document.exitFullscreen(); } catch (_) {} }
-    Core.phase = "feedback";
-    const fb = await Forms.feedback();
-    D.save("feedback", [{ participant_id: D.pid, ...fb, submitted: Core.iso() }]);
-    lastStep = "feedback";
-
-    // ── Final rows ───────────────────────────────────────────────────────
-    D.save("summary", [summaryRow("complete")]);
-    const end = Core.iso();
-    D.save("sessions", [{
-      ...sessionInfo, status: "completed", end_time: end,
-      duration_min: Math.round((Date.parse(end) - Date.parse(startedAt)) / 600) / 100,
-      window_blur_count: Core.Quality.blurCount, tab_hidden_count: Core.Quality.hiddenCount,
-      fullscreen_exit_count: Core.Quality.fullscreenExits,
-      end_refresh_rate_hz: endFrames.refresh_rate_hz, end_frame_ms_sd: endFrames.frame_ms_sd,
-      end_frames_dropped_pct: endFrames.frames_dropped_pct,
-    }]);
-    saveEvents();
-    D.finished = true;                  // closing the page now is not a "quit"
-
-    // ── Upload + debrief ─────────────────────────────────────────────────
-    Forms.uploading();
-    const ok = await D.flush();
-    if (ok) await D.markComplete();
-    window.removeEventListener("beforeunload", warnOnLeave);
-    Forms.debrief(ok);
+    // ── End ──────────────────────────────────────────────────────────────
+    Core.step = "end";
+    Debug.setStep("end");
+    if (Core.isFullscreen()) {
+      D.merge("session", { end_frames: await Core.measureFrames(60) });   // did the machine slow down?
+      await Core.exitFullscreen();
+    }
+    const end = iso();
+    D.merge("session", {
+      end_time: end,
+      duration_min: startedAt ? Math.round((Date.parse(end) - Date.parse(startedAt)) / 600) / 100 : "",
+    });
+    if (D.uploadEnabled) Forms.uploading();
+    const ok = await D.finish();
+    if (ok || !D.uploadEnabled) window.removeEventListener("beforeunload", warnOnLeave);
+    if (DEBUG && params.get("end") !== "debrief") Debug.endScreen(D.lastSnapshot, ok);
+    else Forms.debrief(ok);
   }
 
   window.addEventListener("DOMContentLoaded", () => {
     main().catch((err) => {
       console.error(err);
       Core.Events.log("Session", 0, "error", String(err && err.stack || err));
-      try { D.flushStreams(); saveEvents(); } catch (_) {}
+      try { D.checkpoint("error"); } catch (_) {}
       Core.showPage();
       Core.page().innerHTML = "";
-      const c = Core.el("div", "card", null, Core.page());
-      Core.el("h1", null, "Something went wrong", c);
-      Core.el("p", null, `Sorry, the study hit an error. Please contact ${CONFIG.RESEARCHER_CONTACT} and quote code ${D.pid}.`, c);
-      Core.el("pre", "error", String(err && err.message || err), c);
-      const b = Core.el("button", "btn", "Download data collected so far", c);
+      const c = el("div", "card", null, Core.page());
+      el("h1", null, "Something went wrong", c);
+      el("p", null, `Sorry, the study hit an error. Please contact ${CONFIG.RESEARCHER_CONTACT} and quote code ${D.pid}.`, c);
+      el("pre", "error", String(err && err.message || err), c);
+      const b = el("button", "btn", "Download data collected so far", c);
       b.onclick = () => D.downloadJSON();
     });
   });
 
-  window.App = { VERSION };
+  window.App = { VERSION: CONFIG.APP_VERSION, RUNNERS };
 })();

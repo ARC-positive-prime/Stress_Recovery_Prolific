@@ -1,65 +1,41 @@
 /*
- * MIST stressor — port of mist_l5.py (+ the shared pieces of mist.py).
+ * MIST (Montreal Imaging Stress Task): port of the lab mist_l5.py / mist.py,
+ * plus the classic baseline (calibration) block.
  *
- *   Intro → Practice (5 timed trials, feedback, no performance bar) →
- *   Experimental (35 trials: countdown, rigged-feeling performance bar,
- *   adaptive time limit ±10 % within 2.5–7 s) → End
- *   Trial: problem (until ENTER / time limit) → feedback 0.5 s → blank
- *   1.5 s → next problem (fixed; see CONFIG.MIST).
+ * Step "mist_baseline": MIST.runBaseline()
+ *   PRACTICE block, nothing at stake (Dedovic et al., 2005 training phase):
+ *   self-paced (no countdown shown, no time limit except a hidden safety cap),
+ *   no performance bar, no noise, "Correct / Incorrect" after each answer.
+ *   The participant's average time on correct answers sets the starting
+ *   time limit of the stressor:
+ *     initial limit = TIME_LIMIT_FACTOR (0.9) × mean RT of correct answers,
+ *     kept within [MIST.MIN_TIME_LIMIT, MIST.MAX_TIME_LIMIT];
+ *   fewer than MIN_CORRECT correct answers → MIST.TIME_LIMIT (default).
+ *   Saved as "mist_calibration" in the data file.
  *
+ * Step "mist": MIST.run()  (the stressor)
+ *   Intro (average-performance rule, scaled score, reward) → [optional timed
+ *   practice] → performance-bar screen → 35 timed trials with countdown,
+ *   performance bar, white noise and an adaptive time limit (3 correct in a
+ *   row → −10 %, 3 wrong/too slow in a row → +10 %, within 2.5–7 s).
+ *
+ * Trial: problem (until ENTER / time limit) → feedback 0.5 s → blank 1.5 s.
  * Responding: number keys 0–9 select a digit on the dial (re-pressing
- * replaces it, BACKSPACE clears); ENTER submits. When the countdown reaches
- * zero the trial is a timeout (counted incorrect). Background white noise
- * plays for the whole MIST, as in the lab.
+ * replaces it, BACKSPACE clears); ENTER submits.
  *
- * Differences from the lab version
- *  - No per-participant staircase: level and starting time limit come from
- *    CONFIG.MIST (mist_l5.py standalone defaults: level 4, 5 s).
- *  - The time limit changes only after 3 same-kind answers in a row (the
- *    count restarts after each change) and is capped at 2.5–7 s. The lab
- *    re-checked after every trial with no cap, so it kept growing for a
- *    participant who stopped answering.
- *  - Fixed 2 s from feedback onset to the next problem; the lab's adaptive
- *    pause was longest (up to 3.5 s) after the fastest answers.
- *  - `time_limit` is the limit in force on that trial; the lab CSV wrote the
- *    post-adaptation value there. The post-adaptation value is in
- *    `next_time_limit`. For timeouts `rt` is that trial's limit.
+ * Settings: CONFIG.MIST_BASELINE and CONFIG.MIST (js/config.js)
+ * Wording:  TEXTS.MIST_BASELINE and TEXTS.MIST (js/texts.js)
+ * Test alone: debug.html → "MIST baseline" / "MIST".
  */
 (function () {
   "use strict";
   const C = () => CONFIG.MIST;
+  const B = () => CONFIG.MIST_BASELINE;
   const { el, stage, present, sleep, sec, iso, now } = Core;
 
-  const TRIGGERS = { block_start_exp: 20, trial_onset: 1, response: 2, feedback_onset: 3, block_end: 9 };
+  const TRIGGERS = { block_start_baseline: 21, block_start_exp: 20, trial_onset: 1, response: 2, feedback_onset: 3, block_end: 9 };
   const DIGIT_KEYS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
-  const INSTRUCT_INTRO = `MENTAL ARITHMETIC TEST
-
-You will now solve arithmetic problems.
-Every answer is a single digit from 0 to 9.
-
-Type the answer with the NUMBER KEYS at the top of your keyboard.
-Your choice lights up on the dial on the right.
-Press ENTER to submit. BACKSPACE clears your choice.
-
-If the timer runs out, the problem counts as wrong.
-
-This part plays background noise — please keep your sound on.
-
-Press SPACE to continue.`;
-
-  const INSTRUCT_PRACTICE = `PRACTICE
-
-You will now solve a few problems with the countdown timer active.
-Select your answer on the dial and press ENTER before time runs out.
-
-Feedback will be shown after each trial.
-
-Press SPACE to begin.`;
-
-  const INSTRUCT_END = `The task is complete. Thank you!
-
-Press SPACE to continue.`;
+  const r4 = (x) => Math.round(x * 10000) / 10000;
 
   // ── Problems ───────────────────────────────────────────────────────────
   let bank = [], bankPos = 0;
@@ -75,8 +51,7 @@ Press SPACE to continue.`;
   /*
    * Adaptive time limit. A change needs ADAPTIVE_WINDOW same-kind answers
    * in a row (3 correct → −10 %, 3 wrong/too slow → +10 %); both run counts
-   * restart after every change, so each further change needs another full
-   * run. The limit stays within [MIN_TIME_LIMIT, MAX_TIME_LIMIT].
+   * restart after every change. The limit stays within [MIN, MAX].
    */
   function makeAdapter() {
     let correctRun = 0, wrongRun = 0;
@@ -95,11 +70,49 @@ Press SPACE to continue.`;
     };
   }
 
-  // Blank screen between the feedback and the next problem (fixed).
-  async function gap(st) {
-    await present(() => { st.screen.style.visibility = "hidden"; st.feedback.style.visibility = "hidden"; });
-    await sleep(C().GAP_AFTER_FEEDBACK);
+  // ── Calibration from the baseline block ────────────────────────────────
+  const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
+  const median = (a) => {
+    if (!a.length) return null;
+    const s = a.slice().sort((x, y) => x - y), m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  };
+
+  // Uses correct answers only, and only those given with the page in focus
+  // (a trial with a tab switch / lost focus / full-screen exit would inflate
+  // the average and make the stressor too easy).
+  function calibrate(rows) {
+    const P = B(), M = C();
+    const answered = rows.filter((r) => r.answered === 1);
+    const correctRows = rows.filter((r) => r.accuracy === 1);
+    const correctRts = correctRows.filter((r) => r.focus_lost !== 1).map((r) => r.rt);
+    const m = mean(correctRts), md = median(correctRts);
+    const stat = P.STATISTIC === "median" ? md : m;
+    const enough = correctRts.length >= P.MIN_CORRECT && stat != null;
+    const raw = enough ? stat * P.TIME_LIMIT_FACTOR : null;
+    const initial = enough ? Math.max(M.MIN_TIME_LIMIT, Math.min(M.MAX_TIME_LIMIT, raw)) : M.TIME_LIMIT;
+    return {
+      level: M.LEVEL,
+      n_trials: rows.length,
+      n_answered: answered.length,
+      n_correct: correctRows.length,
+      n_correct_used: correctRts.length,
+      n_excluded_focus_lost: correctRows.length - correctRts.length,
+      accuracy: rows.length ? r4(correctRows.length / rows.length) : "",
+      mean_rt_correct: m == null ? "" : r4(m),
+      median_rt_correct: md == null ? "" : r4(md),
+      statistic: P.STATISTIC === "median" ? "median" : "mean",
+      factor: P.TIME_LIMIT_FACTOR,
+      raw_time_limit: raw == null ? "" : r4(raw),
+      initial_time_limit: r4(initial),
+      min_time_limit: M.MIN_TIME_LIMIT,
+      max_time_limit: M.MAX_TIME_LIMIT,
+      min_correct: P.MIN_CORRECT,
+      source: enough ? "baseline" : "default",
+    };
   }
+
+  let calibration = null;   // set by runBaseline(); read by run()
 
   // ── White noise (Web Audio) ────────────────────────────────────────────
   let noiseNode = null;
@@ -173,7 +186,8 @@ Press SPACE to continue.`;
     };
   }
 
-  function buildStims(withBar) {
+  // withBar: performance bar (stressor only). withTimer: countdown visible.
+  function buildStims({ withBar, withTimer }) {
     const s = stage();
     s.innerHTML = "";
     const st = {
@@ -183,6 +197,8 @@ Press SPACE to continue.`;
     st.perf = withBar ? buildPerfBar(st.screen) : null;
     st.problemBox = el("div", "mist-problem", null, st.screen);
     st.timer = el("div", "mist-timer", "00:00", st.screen);
+    if (!withTimer) st.timer.style.display = "none";
+    st.withTimer = withTimer;
     st.dial = buildDial(st.screen);
     st.feedbackText = el("span", null, "", st.feedback);
     return st;
@@ -192,6 +208,12 @@ Press SPACE to continue.`;
     const s = Math.max(0, Math.floor(t));
     return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
   };
+
+  // Blank screen between the feedback and the next problem (fixed).
+  async function gap(st) {
+    await present(() => { st.screen.style.visibility = "hidden"; st.feedback.style.visibility = "hidden"; });
+    await sleep(C().GAP_AFTER_FEEDBACK);
+  }
 
   // ── Trial ──────────────────────────────────────────────────────────────
   async function runTrial(st, problem, timeLimit) {
@@ -210,8 +232,8 @@ Press SPACE to continue.`;
     ev(TRIGGERS.trial_onset, "trial_onset");
     const frameMs = Core.lastFrameMs;
 
-    // Countdown display, refreshed every frame.
-    let running = true;
+    // Countdown display, refreshed every frame (stressor only).
+    let running = st.withTimer;
     (function tick() {
       if (!running) return;
       st.timer.textContent = fmt(timeLimit - (now() - onset) / 1000);
@@ -230,27 +252,33 @@ Press SPACE to continue.`;
     running = false;
     ev(TRIGGERS.response, "response");
 
-    const answer = selected || "";
+    const answer = selected || "";   // on a timeout: the digit selected but not submitted (counts as wrong)
     const timedOut = r.timedOut;
     const correct = !timedOut && answer !== "" && Number(answer) === problem.answer;
-    return { onset, frameMs, trialStart, trialEnd: iso(), answer, timedOut, correct, rt: timedOut ? timeLimit : r.rt };
+    return {
+      onset, frameMs, trialStart, trialEnd: iso(), answer, timedOut, correct, skipped: !!r.skipped,
+      rt: timedOut ? timeLimit : r.rt,
+    };
   }
 
-  async function showFeedback(st, correct, timedOut) {
+  async function showFeedback(st, text, colour) {
     await present(() => {
       st.screen.style.visibility = "hidden";
-      st.feedbackText.textContent = timedOut ? "Too Slow!" : correct ? "CORRECT" : "INCORRECT";
-      st.feedbackText.style.color = timedOut ? "orange" : correct ? "rgb(0,128,0)" : "red";
+      st.feedbackText.textContent = text;
+      st.feedbackText.style.color = colour;
       st.feedback.style.visibility = "visible";
     });
     Core.Events.log("MIST_Markers", TRIGGERS.feedback_onset, "feedback_onset");
     await sleep(C().FEEDBACK_DUR);
   }
+  const GREEN = "rgb(0,128,0)", RED = "red", ORANGE = "orange";
 
-  function row(block, n, problem, res, timeLimit, nextLimit) {
+  function row(block, n, problem, res, timeLimit, nextLimit, extra = {}) {
     return {
       participant_id: Core.Data.pid,
       session: Core.Data.session,
+      step: Core.step,
+      phase: block === "baseline" ? "mist_baseline" : "stressor",
       block,
       trial: n,
       level: C().LEVEL,
@@ -259,15 +287,14 @@ Press SPACE to continue.`;
       participant_answer: res.answer,
       accuracy: Number(res.correct),
       answered: Number(!res.timedOut && res.answer !== ""),
-      rt: Math.round(res.rt * 10000) / 10000,
-      time_limit: Math.round(timeLimit * 10000) / 10000,
-      trial_start_time: res.trialStart,
-      trial_end_time: res.trialEnd,
-      // online-only columns
-      phase: "stressor",
       outcome: res.timedOut ? "missed" : res.correct ? "correct" : "incorrect",
       timed_out: Number(res.timedOut),
-      next_time_limit: Math.round(nextLimit * 10000) / 10000,
+      rt: r4(res.rt),
+      time_limit: timeLimit === "" ? "" : r4(timeLimit),
+      max_time_s: extra.max_time_s != null ? extra.max_time_s : "",
+      next_time_limit: nextLimit === "" ? "" : r4(nextLimit),
+      trial_start_time: res.trialStart,
+      trial_end_time: res.trialEnd,
       trial_onset_time: sec(res.onset),
       onset_frame_ms: res.frameMs,
       focus_lost: Number(Core.Quality.trialFlags.focusLost),
@@ -275,41 +302,87 @@ Press SPACE to continue.`;
     };
   }
 
-  // Each row is also streamed to the server as it happens (Core.Data.stream),
-  // so a participant who quits mid-task still leaves the trials done so far.
   function keep(rows, r) {
     rows.push(r);
     Core.Data.stream("mist_trials", r);
   }
 
-  async function runPractice() {
+  // Pause between trials if the participant left full screen.
+  async function checkFullscreen() {
+    if (!Core.isFullscreen()) { await Core.betweenTrials(); Core.showStage(); }
+  }
+
+  // ── Baseline block (step "mist_baseline") ──────────────────────────────
+  async function runBaseline() {
+    Core.phase = "mist_baseline";
+    const TB = TEXTS.MIST_BASELINE;
+    await Core.instructions(TB.INTRO, { minMs: 4000 });
+    Core.showStage();
+    const st = buildStims({ withBar: false, withTimer: false });
+    const cap = B().MAX_TRIAL_S;
     const rows = [];
-    const st = buildStims(false);
-    const limit = C().TIME_LIMIT;
+    Core.Events.log("MIST_Markers", TRIGGERS.block_start_baseline, "block_start_baseline");
+    for (let i = 0; i < B().N_TRIALS; i++) {
+      if (Core.Skip.requested) break;
+      await checkFullscreen();
+      const p = nextProblem();
+      await gap(st);
+      const res = await runTrial(st, p, cap);
+      if (res.skipped) break;
+      if (B().SHOW_FEEDBACK) {
+        const F = TB.FEEDBACK;
+        if (res.timedOut) await showFeedback(st, F.no_answer, ORANGE);
+        else await showFeedback(st, res.correct ? F.correct : F.incorrect, res.correct ? GREEN : RED);
+      } else {
+        await present(() => { st.screen.style.visibility = "hidden"; });
+      }
+      keep(rows, row("baseline", i + 1, p, res, "", "", { max_time_s: cap }));
+    }
+    Core.Events.log("MIST_Markers", TRIGGERS.block_end, "block_end");
+    calibration = calibrate(rows);
+    Core.Data.set("mist_calibration", calibration);
+    Core.Events.log("MIST_Markers", 0, "time_limit_set", JSON.stringify(calibration));
+    await Core.instructions(TB.END);
+    return rows;
+  }
+
+  // ── Stressor (step "mist") ─────────────────────────────────────────────
+  async function runPractice(limit) {
+    const rows = [];
+    const st = buildStims({ withBar: false, withTimer: true });
+    const F = TEXTS.MIST.FEEDBACK;
     for (let i = 0; i < C().N_PRACTICE_TRIALS; i++) {
+      if (Core.Skip.requested) break;
+      await checkFullscreen();
       const p = nextProblem();
       await gap(st);
       const res = await runTrial(st, p, limit);
-      await showFeedback(st, res.correct, res.timedOut);
+      if (res.skipped) break;
+      await showFeedback(st, res.timedOut ? F.too_slow : res.correct ? F.correct : F.incorrect,
+        res.timedOut ? ORANGE : res.correct ? GREEN : RED);
       keep(rows, row("practice", i + 1, p, res, limit, limit));
     }
     return rows;
   }
 
-  async function runExperimental() {
+  async function runExperimental(startLimit) {
     const rows = [];
-    const st = buildStims(true);
+    const st = buildStims({ withBar: true, withTimer: true });
+    const F = TEXTS.MIST.FEEDBACK;
     const window10 = [];
     const adapt = makeAdapter();
-    let timeLimit = C().TIME_LIMIT;
+    let timeLimit = startLimit;
     Core.Events.log("MIST_Markers", TRIGGERS.block_start_exp, "block_start_exp");
 
     for (let i = 0; i < C().N_EXP_TRIALS; i++) {
+      if (Core.Skip.requested) break;
+      await checkFullscreen();
       const p = nextProblem();
       await gap(st);
 
       const usedLimit = timeLimit;
       const res = await runTrial(st, p, usedLimit);
+      if (res.skipped) break;
 
       window10.push(Number(res.correct));
       if (window10.length > 10) window10.shift();
@@ -317,7 +390,8 @@ Press SPACE to continue.`;
 
       timeLimit = adapt(timeLimit, res.correct);
 
-      await showFeedback(st, res.correct, res.timedOut);
+      await showFeedback(st, res.timedOut ? F.too_slow : res.correct ? F.correct : F.incorrect,
+        res.timedOut ? ORANGE : res.correct ? GREEN : RED);
       keep(rows, row("experimental", i + 1, p, res, usedLimit, timeLimit));
     }
     Core.Events.log("MIST_Markers", TRIGGERS.block_end, "block_end");
@@ -325,43 +399,52 @@ Press SPACE to continue.`;
   }
 
   // Annotated performance-bar instructions (mist.show_exp_instructions).
-  function expInstructionsExtra() {
+  function barInstructionsExtra() {
+    const T = TEXTS.MIST;
     const wrap = el("div", "exp-instruct");
     const p = buildPerfBar(wrap);
     p.bar.classList.add("perf-bar-static");
     p.set(0.4);
     const zones = el("div", "zone-labels", null, wrap);
-    el("div", "zl zl-red", "Below average\n(0 – 60 %)", zones);
-    el("div", "zl zl-white", "Average\n(60 – 80 %)", zones);
-    el("div", "zl zl-green", "Above average\n(80 – 100 %)", zones);
-    el("div", "legend", "Upward marker (below the bar)   =  Your score\nDownward marker (above the bar) =  Group average", wrap);
-    el("div", "legend-instr",
-      "Solve problems as quickly and accurately as possible.\n" +
-      "A countdown timer appears on screen. Select your answer on the dial and press ENTER.\n\n" +
-      "Press SPACE to begin.", wrap);
+    el("div", "zl zl-red", T.BAR_ZONES[0], zones);
+    el("div", "zl zl-white", T.BAR_ZONES[1], zones);
+    el("div", "zl zl-green", T.BAR_ZONES[2], zones);
+    el("div", "legend", T.BAR_LEGEND, wrap);
+    el("div", "legend-instr", T.BAR_INSTRUCTIONS, wrap);
     return wrap;
   }
 
   async function run() {
     Core.phase = "stressor";
+    // Starting time limit: from the baseline block if it ran in this session.
+    if (!calibration) {
+      calibration = { ...calibrate([]), source: "default", note: "mist_baseline step not run" };
+      Core.Data.set("mist_calibration", calibration);
+    }
+    const startLimit = calibration.initial_time_limit;
+    Core.Data.merge("mist_calibration", { stressor_initial_time_limit: startLimit });
+    Core.Events.log("MIST_Markers", 0, "time_limit_set", JSON.stringify({ initial_time_limit: startLimit, source: calibration.source }));
     let rows = [];
     try {
-      await Core.instructions(INSTRUCT_INTRO);
+      await Core.instructions(TEXTS.MIST.INTRO, { minMs: 5000 });
       startNoise();
       if (C().N_PRACTICE_TRIALS > 0) {
-        await Core.instructions(INSTRUCT_PRACTICE);
+        await Core.instructions(TEXTS.MIST.PRACTICE);
         Core.showStage();
-        rows = rows.concat(await runPractice());
+        rows = rows.concat(await runPractice(startLimit));
       }
-      await Core.instructions("STRESS TEST", { extra: expInstructionsExtra() });
+      await Core.instructions(TEXTS.MIST.BAR_TITLE, { extra: barInstructionsExtra(), minMs: 3000 });
       Core.showStage();
-      rows = rows.concat(await runExperimental());
+      rows = rows.concat(await runExperimental(startLimit));
     } finally {
       stopNoise();
     }
-    await Core.instructions(INSTRUCT_END);
+    await Core.instructions(TEXTS.MIST.END);
     return rows;
   }
 
-  window.MIST = { run, nextProblem, makeAdapter, TRIGGERS };
+  window.MIST = {
+    run, runBaseline, calibrate, nextProblem, makeAdapter, TRIGGERS,
+    get calibration() { return calibration; },
+  };
 })();
