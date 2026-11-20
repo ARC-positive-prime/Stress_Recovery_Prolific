@@ -1,4 +1,4 @@
-# Stress & Recovery — online version (Prolific)
+# Stress & Recovery - online version (Prolific)
 
 A browser-based, single-session version of the `stress-recovery-exp-with-stroop`
 lab protocol, built to run on Prolific. Participants open a link on their own
